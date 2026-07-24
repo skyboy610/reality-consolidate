@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -214,6 +214,28 @@ find_stream_so() {
   return 1
 }
 
+stream_module_already_loaded() {
+  local d
+  grep -qE 'load_module[[:space:]]+[^;]*ngx_stream_module\.so' "$NGINX_CONF" 2>/dev/null && return 0
+  for d in "$NGINX_DIR/modules-enabled" "$NGINX_DIR/conf.d"; do
+    [ -d "$d" ] || continue
+    grep -RqE 'load_module[[:space:]]+[^;]*ngx_stream_module\.so' "$d" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# nginx refuses to start if the same module is loaded twice. If our injected
+# line is the duplicate, drop it from nginx.conf (the distribution's own
+# modules-enabled entry stays).
+drop_our_load_module() {
+  grep -qE '^load_module[[:space:]]+[^;]*ngx_stream_module\.so' "$NGINX_CONF" 2>/dev/null || return 1
+  local tmp; tmp=$(mktemp)
+  grep -vE '^load_module[[:space:]]+[^;]*ngx_stream_module\.so' "$NGINX_CONF" > "$tmp"
+  mv "$tmp" "$NGINX_CONF"
+  warn "Removed a duplicate load_module line that nginx rejected."
+  return 0
+}
+
 install_nginx() {
   if ! have nginx; then
     info "Installing nginx..."
@@ -265,14 +287,16 @@ install_nginx() {
     return 1
   fi
 
-  if ! grep -rqE 'load_module[[:space:]]+[^;]*ngx_stream_module\.so' \
-        "$NGINX_CONF" "$NGINX_DIR/modules-enabled" "$NGINX_DIR/conf.d" 2>/dev/null; then
+  # -R (not -r): on Debian/Ubuntu modules-enabled/*.conf are symlinks into
+  # /usr/share/nginx/modules-available, and -r silently skips symlinks - which
+  # made an earlier version inject a duplicate load_module and break nginx -t.
+  if stream_module_already_loaded; then
+    info "stream module already loaded by an existing load_module directive."
+  else
     info "Adding load_module directive for ${so}"
     local tmp; tmp=$(mktemp)
     { printf 'load_module %s;\n' "$so"; cat "$NGINX_CONF"; } > "$tmp"
     mv "$tmp" "$NGINX_CONF"
-  else
-    info "stream module already loaded by an existing load_module directive."
   fi
 
   systemctl enable "$NGINX_SERVICE" >/dev/null 2>&1 || true
@@ -479,19 +503,17 @@ v_port() {
 # Display
 # ---------------------------------------------------------------------------
 show_table() {
-  printf '%s %-3s %-24s %-7s %-11s %-9s %-6s %s%s\n' "$C_TURQ" \
-    "#" "REMARK" "PORT" "LISTEN" "PROTO" "NET" "SNI" "$R"
-  printf '%s%s%s\n' "$C_GRAY" "-------------------------------------------------------------------------------" "$R"
-  local i lst tag
+  printf '%s %-3s %-20s %-7s %-6s %-6s %s%s\n' "$C_TURQ" \
+    "#" "REMARK" "PORT" "NET" "ON443" "SNI" "$R"
+  printf '%s%s%s\n' "$C_GRAY" "---------------------------------------------------------------" "$R"
+  local i on
   for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-    lst="${RI_LISTEN[$i]}"; [ -n "$lst" ] || lst="0.0.0.0"
-    tag=""
-    [ "$lst" = "127.0.0.1" ] && tag=" *"
-    printf ' %-3s %-24s %-7s %-11s %-9s %-6s %s%s\n' \
-      "$((i + 1))" "${RI_REMARK[$i]:0:24}" "${RI_PORT[$i]}" "$lst" \
-      "${RI_PROTO[$i]}" "${RI_NET[$i]}" "${RI_SNI[$i]}" "$tag"
+    if [ "${RI_LISTEN[$i]}" = "127.0.0.1" ]; then on="yes"; else on="no"; fi
+    printf ' %-3s %-20s %-7s %-6s %-6s %s\n' \
+      "$((i + 1))" "${RI_REMARK[$i]:0:20}" "${RI_PORT[$i]}" \
+      "${RI_NET[$i]}" "$on" "${RI_SNI[$i]}"
   done
-  printf '%s * = already routed behind 443%s\n\n' "$C_GRAY" "$R"
+  echo
 }
 
 # ---------------------------------------------------------------------------
@@ -642,6 +664,11 @@ unhook_stream_include() {
 
 apply_nginx() {
   local backup_dir="$1"
+  if ! nginx -t 2>/tmp/r443.nginx.err; then
+    if grep -q 'is already loaded' /tmp/r443.nginx.err && drop_our_load_module; then
+      info "Retrying nginx config test..."
+    fi
+  fi
   if nginx -t 2>/tmp/r443.nginx.err; then
     ok "nginx config test passed."
     if systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null; then
@@ -851,8 +878,8 @@ do_setup() {
   printf '%sPlanned changes%s\n' "$C_PURPLE" "$R"
   for idx in "${sel[@]}"; do
     i=$((idx - 1))
-    printf '  %-24s %s:%s  ->  127.0.0.1:%s   [SNI %s]\n' \
-      "${RI_REMARK[$i]:0:24}" "${RI_LISTEN[$i]:-0.0.0.0}" "${RI_PORT[$i]}" "${plan_port[$i]}" "${RI_SNI[$i]}"
+    printf '  %-20s :%-6s ->  127.0.0.1:%-6s [%s]\n' \
+      "${RI_REMARK[$i]:0:20}" "${RI_PORT[$i]}" "${plan_port[$i]}" "${RI_SNI[$i]}"
   done
   printf '  Link host                %s:443\n' "$PUBLIC_HOST"
   printf '  Panel via 443            %s%s\n' "$PANEL_ROUTE" "$([ "$PANEL_ROUTE" = yes ] && printf ' (%s -> :%s)' "$PANEL_HOST" "$(panel_port)")"
