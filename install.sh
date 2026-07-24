@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -114,8 +114,11 @@ banner() {
   local n_state="bad" s_state="bad" n_note="" s_note=""
   if have nginx; then
     case "$(stream_state)" in
-      static|dynamic) n_state="ok"; n_note="stream module ready" ;;
-      *) n_state="warn"; n_note="stream module missing" ;;
+      static) n_state="ok"; n_note="stream built in" ;;
+      dynamic)
+        if find_stream_so >/dev/null 2>&1; then n_state="ok"; n_note="stream module found"
+        else n_state="warn"; n_note="stream .so not installed"; fi ;;
+      *) n_state="warn"; n_note="no stream module" ;;
     esac
   fi
   if [ -f "$STREAM_FILE" ] && grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null; then
@@ -194,6 +197,23 @@ modules_path() {
   printf '%s\n' "$p"
 }
 
+# Locates ngx_stream_module.so. Distributions disagree on where it lands, so
+# check the compiled-in modules-path, then the usual suspects, then fall back
+# to an actual filesystem search. Prints the path, or nothing if absent.
+find_stream_so() {
+  local cand
+  for cand in "$(modules_path)/ngx_stream_module.so" \
+              /usr/lib/nginx/modules/ngx_stream_module.so \
+              /usr/lib64/nginx/modules/ngx_stream_module.so \
+              /usr/share/nginx/modules/ngx_stream_module.so \
+              /etc/nginx/modules/ngx_stream_module.so; do
+    [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  cand=$(find /usr /etc /opt -name 'ngx_stream_module.so' -type f 2>/dev/null | head -n1)
+  [ -n "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  return 1
+}
+
 install_nginx() {
   if ! have nginx; then
     info "Installing nginx..."
@@ -208,37 +228,55 @@ install_nginx() {
     ok "nginx already present."
   fi
 
-  local st
+  local st so
   st=$(stream_state)
-  if [ "$st" = "missing" ]; then
-    if [ "$(pkg_mgr)" = "apt" ]; then
-      info "stream module not compiled in - installing libnginx-mod-stream..."
-      install_pkgs libnginx-mod-stream || true
-      st=$(stream_state)
-    fi
+
+  # "static" means it is baked into the binary and always available.
+  if [ "$st" = "static" ]; then
+    ok "nginx stream module: built in"
+    systemctl enable "$NGINX_SERVICE" >/dev/null 2>&1 || true
+    return 0
   fi
-  if [ "$st" = "missing" ]; then
-    err "This nginx build has no stream module (nginx -V shows no --with-stream)."
-    err "Install an nginx build that includes it, then re-run."
+
+  # Either declared dynamic, or not declared at all. Both cases can be solved
+  # by the distribution's separate stream-module package, so try that first
+  # before giving up.
+  so=$(find_stream_so || true)
+  if [ -z "$so" ]; then
+    case "$(pkg_mgr)" in
+      apt) info "stream module file not present - installing libnginx-mod-stream..."
+           install_pkgs libnginx-mod-stream || true ;;
+      dnf|yum) info "stream module file not present - installing nginx-mod-stream..."
+           install_pkgs nginx-mod-stream || true ;;
+    esac
+    so=$(find_stream_so || true)
+  fi
+
+  if [ -z "$so" ]; then
+    st=$(stream_state)
+    if [ "$st" = "static" ]; then
+      ok "nginx stream module: built in"
+      systemctl enable "$NGINX_SERVICE" >/dev/null 2>&1 || true
+      return 0
+    fi
+    err "Could not find or install ngx_stream_module.so on this system."
+    err "nginx -V says: $(nginx -V 2>&1 | tr ' ' '\n' | grep -E 'with-stream|modules-path' | tr '\n' ' ')"
+    err "Install your distribution's nginx stream module package, then re-run."
     return 1
   fi
 
-  if [ "$st" = "dynamic" ]; then
-    local so; so="$(modules_path)/ngx_stream_module.so"
-    if [ ! -f "$so" ]; then
-      err "Dynamic stream module declared but ${so} not found."
-      return 1
-    fi
-    if ! grep -rqE 'load_module[[:space:]]+[^;]*ngx_stream_module\.so' "$NGINX_CONF" "$NGINX_DIR/modules-enabled" 2>/dev/null; then
-      info "Adding load_module directive for the stream module."
-      local tmp; tmp=$(mktemp)
-      { printf 'load_module %s;\n' "$so"; cat "$NGINX_CONF"; } > "$tmp"
-      mv "$tmp" "$NGINX_CONF"
-    fi
+  if ! grep -rqE 'load_module[[:space:]]+[^;]*ngx_stream_module\.so' \
+        "$NGINX_CONF" "$NGINX_DIR/modules-enabled" "$NGINX_DIR/conf.d" 2>/dev/null; then
+    info "Adding load_module directive for ${so}"
+    local tmp; tmp=$(mktemp)
+    { printf 'load_module %s;\n' "$so"; cat "$NGINX_CONF"; } > "$tmp"
+    mv "$tmp" "$NGINX_CONF"
+  else
+    info "stream module already loaded by an existing load_module directive."
   fi
 
   systemctl enable "$NGINX_SERVICE" >/dev/null 2>&1 || true
-  ok "nginx stream module: ${st}"
+  ok "nginx stream module: dynamic (${so})"
   return 0
 }
 
