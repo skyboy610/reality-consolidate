@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.4.1"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -131,8 +131,12 @@ banner() {
 }
 
 count_routed() {
+  local n
   [ -f "$STREAM_FILE" ] || { echo 0; return; }
-  grep -cE '^\s+"' "$STREAM_FILE" 2>/dev/null || echo 0
+  # grep -c prints 0 AND exits 1 on no match, so "|| echo 0" would emit "0\n0".
+  n=$(grep -cE '^[[:space:]]+"' "$STREAM_FILE" 2>/dev/null) || true
+  [ -n "$n" ] || n=0
+  printf '%s\n' "$n"
 }
 
 # ---------------------------------------------------------------------------
@@ -200,17 +204,21 @@ modules_path() {
 # Locates ngx_stream_module.so. Distributions disagree on where it lands, so
 # check the compiled-in modules-path, then the usual suspects, then fall back
 # to an actual filesystem search. Prints the path, or nothing if absent.
+STREAM_SO_CACHE=""
 find_stream_so() {
   local cand
+  if [ -n "$STREAM_SO_CACHE" ] && [ -f "$STREAM_SO_CACHE" ]; then
+    printf '%s\n' "$STREAM_SO_CACHE"; return 0
+  fi
   for cand in "$(modules_path)/ngx_stream_module.so" \
               /usr/lib/nginx/modules/ngx_stream_module.so \
               /usr/lib64/nginx/modules/ngx_stream_module.so \
               /usr/share/nginx/modules/ngx_stream_module.so \
               /etc/nginx/modules/ngx_stream_module.so; do
-    [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+    [ -f "$cand" ] && { STREAM_SO_CACHE="$cand"; printf '%s\n' "$cand"; return 0; }
   done
   cand=$(find /usr /etc /opt -name 'ngx_stream_module.so' -type f 2>/dev/null | head -n1)
-  [ -n "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  [ -n "$cand" ] && { STREAM_SO_CACHE="$cand"; printf '%s\n' "$cand"; return 0; }
   return 1
 }
 
@@ -609,9 +617,8 @@ write_stream_conf() {
     echo "    listen 443 reuseport;"
     echo "    listen [::]:443 reuseport;"
     echo "    proxy_pass \$reality443;"
-    echo "    proxy_protocol off;"
     echo "    ssl_preread on;"
-    echo "    proxy_timeout 300s;"
+    echo "    proxy_timeout 1h;"
     echo "    proxy_connect_timeout 5s;"
     echo "}"
   } > "$tmp"
@@ -683,6 +690,107 @@ apply_nginx() {
   sed -n '1,40p' /tmp/r443.nginx.err >&2
   restore_nginx_from "$backup_dir"
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# Verification - prove 443 is really routing before claiming success
+# ---------------------------------------------------------------------------
+verify_live() {
+  local fails=0 eff i p
+
+  printf '\n%sVerification%s\n' "$C_PURPLE" "$R"
+
+  # 1. Is our stream block actually part of the effective configuration?
+  eff=$(nginx -T 2>/dev/null || true)
+  if printf '%s' "$eff" | grep -q 'ssl_preread_server_name'; then
+    ok "stream map is present in the effective nginx config."
+  else
+    err "nginx -T does not contain our stream map."
+    err "The stream {} block is missing from ${NGINX_CONF} - nothing is listening on 443."
+    fails=$((fails + 1))
+  fi
+
+  # 2. Is anything actually bound to :443?
+  if port_busy 443; then
+    local o; o=$(port_owner 443)
+    if [ "$o" = "nginx" ] || [ -z "$o" ]; then
+      ok "port 443 is bound${o:+ by ${o}}."
+    else
+      err "port 443 is bound by '${o}', not nginx."
+      fails=$((fails + 1))
+    fi
+  else
+    err "nothing is listening on port 443."
+    fails=$((fails + 1))
+  fi
+
+  # 3. Is xray actually listening on every internal port we assigned?
+  for ((i = 0; i < ${#RI_ID[@]}; i++)); do
+    [ "${RI_LISTEN[$i]}" = "127.0.0.1" ] || continue
+    p="${RI_PORT[$i]}"
+    if port_busy "$p"; then
+      ok "${RI_REMARK[$i]} is listening on 127.0.0.1:${p}"
+    else
+      err "${RI_REMARK[$i]} is NOT listening on 127.0.0.1:${p} - check 'journalctl -u ${XUI_SERVICE}'."
+      fails=$((fails + 1))
+    fi
+  done
+
+  if [ "$fails" -eq 0 ]; then
+    ok "All checks passed - 443 routing is live."
+    return 0
+  fi
+  err "${fails} check(s) failed. Reality configs will not work until these are fixed."
+  return 1
+}
+
+diagnose() {
+  header
+  db_ready || { pause; return 0; }
+  load_state
+  load_inbounds
+
+  printf '%sConfiguration%s\n' "$C_PURPLE" "$R"
+  printf '  Public host      %s\n' "${PUBLIC_HOST:-<not set>}"
+  printf '  Panel port       %s (via 443: %s %s)\n' "$(panel_port)" "$PANEL_ROUTE" "$PANEL_HOST"
+  printf '  Sub port         %s (via 443: %s %s)\n' "$(sub_port)" "$SUB_ROUTE" "$SUB_HOST"
+  printf '  Stream file      %s\n' "$([ -f "$STREAM_FILE" ] && echo present || echo MISSING)"
+  printf '  Hooked into conf %s\n' "$(grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null && echo yes || echo NO)"
+  echo
+
+  printf '%sServices%s\n' "$C_PURPLE" "$R"
+  printf '  %-8s %s\n' "$XUI_SERVICE" "$(systemctl is-active "$XUI_SERVICE" 2>/dev/null || echo inactive)"
+  printf '  %-8s %s\n' "$NGINX_SERVICE" "$(systemctl is-active "$NGINX_SERVICE" 2>/dev/null || echo inactive)"
+  echo
+
+  if ! nginx -t 2>/tmp/r443.diag.err; then
+    err "nginx config test FAILED:"
+    sed -n '1,10p' /tmp/r443.diag.err >&2
+    echo
+  fi
+
+  verify_live || true
+
+  # SNI reachability probe against the local listener
+  if have openssl && port_busy 443; then
+    echo
+    printf '%sTLS probe on 127.0.0.1:443%s\n' "$C_PURPLE" "$R"
+    local i sni out
+    for ((i = 0; i < ${#RI_ID[@]}; i++)); do
+      [ "${RI_LISTEN[$i]}" = "127.0.0.1" ] || continue
+      sni="${RI_SNI[$i]}"
+      [ -n "$sni" ] || continue
+      out=$(timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$sni" </dev/null 2>&1 || true)
+      if printf '%s' "$out" | grep -q 'Connection refused'; then
+        err "${sni} -> connection refused on 127.0.0.1:443"
+      elif printf '%s' "$out" | grep -q 'subject='; then
+        ok "${sni} -> $(printf '%s' "$out" | grep -m1 'subject=')"
+      else
+        warn "${sni} -> handshake did not complete (normal for some Reality setups; test from outside)."
+      fi
+    done
+  fi
+  pause
 }
 
 # ---------------------------------------------------------------------------
@@ -909,9 +1017,17 @@ do_setup() {
   else err "${XUI_SERVICE} failed to start - check 'systemctl status ${XUI_SERVICE}'."; fi
 
   load_inbounds
-  write_stream_conf || { pause; return 0; }
-  hook_stream_include || { pause; return 0; }
-  apply_nginx "$bdir" || { pause; return 0; }
+  if ! write_stream_conf || ! hook_stream_include; then
+    err "The database is already consolidated but nginx routing is incomplete."
+    err "Fix the issue above, then run 'Sync New Inbounds' to finish - or use Rollback."
+    pause; return 0
+  fi
+  if ! apply_nginx "$bdir"; then
+    err "nginx was rolled back, but the database is already consolidated."
+    err "Fix the nginx error above, then run 'Sync New Inbounds' to finish."
+    pause; return 0
+  fi
+  verify_live || true
 
   echo
   printf '%sSample links%s\n' "$C_PURPLE" "$R"
@@ -954,7 +1070,7 @@ do_sync() {
     local go; go=$(ask "Route them now? [y/N]" v_yn "yes")
     if [ "$go" = "yes" ]; then
       check_sni_unique "${pending[@]}" || { pause; return 0; }
-      local bdir; bdir=$(backup_now)
+      backup_now >/dev/null
       systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
       local idx p
       for idx in "${pending[@]}"; do
@@ -971,8 +1087,12 @@ do_sync() {
   fi
 
   local bdir2; bdir2=$(backup_now)
-  write_stream_conf || { pause; return 0; }
+  if ! write_stream_conf || ! hook_stream_include; then
+    err "Could not complete nginx routing - see the message above."
+    pause; return 0
+  fi
   apply_nginx "$bdir2" || { pause; return 0; }
+  verify_live || true
   pause
 }
 
@@ -1147,9 +1267,10 @@ main_menu() {
     line_c 1 "2) Sync New Inbounds"
     line_c 2 "3) Panel and Ports"
     line_c 3 "4) Services"
-    line_c 4 "5) Rollback Last Change"
-    line_c 5 "6) Remove 443 Routing"
-    line_c 6 "0) Exit"
+    line_c 4 "5) Diagnose"
+    line_c 5 "6) Rollback Last Change"
+    line_c 6 "7) Remove 443 Routing"
+    line_c 7 "0) Exit"
     local ch
     printf '%sChoice%s: ' "$(next_c)" "$R"
     IFS= read -r ch || ch=0
@@ -1158,8 +1279,9 @@ main_menu() {
       2) do_sync ;;
       3) panel_menu ;;
       4) services_menu ;;
-      5) do_rollback ;;
-      6) do_remove ;;
+      5) diagnose ;;
+      6) do_rollback ;;
+      7) do_remove ;;
       0) clear; exit 0 ;;
       *) err "Pick a number from the list."; pause ;;
     esac
