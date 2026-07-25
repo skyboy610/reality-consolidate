@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.4.1"
+SCRIPT_VERSION="2.5.2"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -73,9 +73,9 @@ PAL=("$C_OLIVE" "$C_PINK" "$C_CHERRY" "$C_CHOC" "$C_PURPLE" "$C_TURQ" "$C_BLUE" 
 line_c() { local i="$1"; shift; printf '%s%s%s\n' "${PAL[$((i % ${#PAL[@]}))]}" "$*" "$R"; }
 next_c() { printf '%s' "${PAL[$((PROMPT_IDX % ${#PAL[@]}))]}"; PROMPT_IDX=$((PROMPT_IDX + 1)); }
 
-ok()   { printf '%s[ OK ]%s %s\n'   "$C_OK"   "$R" "$*" >&2; }
-err()  { printf '%s[FAIL]%s %s\n'   "$C_ERR"  "$R" "$*" >&2; }
-warn() { printf '%s[WARN]%s %s\n'   "$C_WARN" "$R" "$*" >&2; }
+ok()   { printf '%s OK %s %s%s%s\n'   "$BG_OK"   "$R" "$C_OK"   "$*" "$R" >&2; }
+err()  { printf '%s FAIL %s %s%s%s\n' "$BG_ERR"  "$R" "$C_ERR"  "$*" "$R" >&2; }
+warn() { printf '%s WARN %s %s%s%s\n' "$BG_WARN" "$R" "$C_WARN" "$*" "$R" >&2; }
 info() { printf '%s%s%s\n' "$C_GRAY" "$*" "$R" >&2; }
 pause() { local _x; printf '%s\nPress Enter to continue...%s' "$C_WHITE" "$R"; read -r _x || true; }
 
@@ -143,6 +143,34 @@ count_routed() {
 # Basics
 # ---------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# True if the address is a private/RFC1918 IP (a GRE/WireGuard tunnel address).
+# Such inbounds keep their listen IP - we still reassign the port and route to
+# "<that IP>:<newport>" instead of 127.0.0.1, because the inbound is reachable
+# on a tunnel interface, not loopback.
+is_private_ip() {
+  local ip="$1"
+  case "$ip" in
+    10.*) return 0 ;;
+    192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The backend address nginx should proxy an inbound to: its own tunnel IP if it
+# has one, otherwise loopback.
+backend_ip() {
+  local listen="$1"
+  if is_private_ip "$listen"; then printf '%s\n' "$listen"; else printf '127.0.0.1\n'; fi
+}
+
+# An inbound is routable once it listens on loopback OR a tunnel IP.
+is_routable_listen() {
+  [ "$1" = "127.0.0.1" ] && return 0
+  is_private_ip "$1" && return 0
+  return 1
+}
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -516,7 +544,12 @@ show_table() {
   printf '%s%s%s\n' "$C_GRAY" "---------------------------------------------------------------" "$R"
   local i on
   for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-    if [ "${RI_LISTEN[$i]}" = "127.0.0.1" ]; then on="yes"; else on="no"; fi
+    if is_routable_listen "${RI_LISTEN[$i]}" \
+       && [ "${RI_PORT[$i]}" -ge "$MIN_PORT" ] && [ "${RI_PORT[$i]}" -le "$MAX_PORT" ]; then
+      on="yes"
+    else
+      on="no"
+    fi
     printf ' %-3s %-20s %-7s %-6s %-6s %s\n' \
       "$((i + 1))" "${RI_REMARK[$i]:0:20}" "${RI_PORT[$i]}" \
       "${RI_NET[$i]}" "$on" "${RI_SNI[$i]}"
@@ -581,11 +614,11 @@ do_rollback() {
 # nginx stream config
 # ---------------------------------------------------------------------------
 write_stream_conf() {
-  local default_backend="" tmp i pport sport
+  local default_backend="" tmp i pport sport bip
   tmp=$(mktemp)
   for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-    if [ "${RI_LISTEN[$i]}" = "127.0.0.1" ] && [ -n "${RI_SNI[$i]}" ]; then
-      default_backend="127.0.0.1:${RI_PORT[$i]}"
+    if is_routable_listen "${RI_LISTEN[$i]}" && [ -n "${RI_SNI[$i]}" ]; then
+      default_backend="$(backend_ip "${RI_LISTEN[$i]}"):${RI_PORT[$i]}"
       break
     fi
   done
@@ -599,8 +632,9 @@ write_stream_conf() {
     echo "map \$ssl_preread_server_name \$reality443 {"
     echo "    default ${default_backend};"
     for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-      if [ "${RI_LISTEN[$i]}" = "127.0.0.1" ] && [ -n "${RI_SNI[$i]}" ]; then
-        printf '    "%s" 127.0.0.1:%s;\n' "${RI_SNI[$i]}" "${RI_PORT[$i]}"
+      if is_routable_listen "${RI_LISTEN[$i]}" && [ -n "${RI_SNI[$i]}" ]; then
+        bip=$(backend_ip "${RI_LISTEN[$i]}")
+        printf '    "%s" %s:%s;\n' "${RI_SNI[$i]}" "$bip" "${RI_PORT[$i]}"
       fi
     done
     if [ "$PANEL_ROUTE" = "yes" ] && [ -n "$PANEL_HOST" ]; then
@@ -725,13 +759,17 @@ verify_live() {
   fi
 
   # 3. Is xray actually listening on every internal port we assigned?
+  #    Tunnel-IP inbounds bind their tunnel address, so a plain :port check on
+  #    loopback would miss them - match on the port alone via "ss".
+  local bip
   for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-    [ "${RI_LISTEN[$i]}" = "127.0.0.1" ] || continue
+    is_routable_listen "${RI_LISTEN[$i]}" || continue
     p="${RI_PORT[$i]}"
+    bip=$(backend_ip "${RI_LISTEN[$i]}")
     if port_busy "$p"; then
-      ok "${RI_REMARK[$i]} is listening on 127.0.0.1:${p}"
+      ok "${RI_REMARK[$i]} is listening on ${bip}:${p}"
     else
-      err "${RI_REMARK[$i]} is NOT listening on 127.0.0.1:${p} - check 'journalctl -u ${XUI_SERVICE}'."
+      err "${RI_REMARK[$i]} is NOT listening on ${bip}:${p} - check 'journalctl -u ${XUI_SERVICE}'."
       fails=$((fails + 1))
     fi
   done
@@ -777,7 +815,7 @@ diagnose() {
     printf '%sTLS probe on 127.0.0.1:443%s\n' "$C_PURPLE" "$R"
     local i sni out
     for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-      [ "${RI_LISTEN[$i]}" = "127.0.0.1" ] || continue
+      is_routable_listen "${RI_LISTEN[$i]}" || continue
       sni="${RI_SNI[$i]}"
       [ -n "$sni" ] || continue
       out=$(timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$sni" </dev/null 2>&1 || true)
@@ -973,7 +1011,8 @@ do_setup() {
   local idx i cur
   for idx in "${sel[@]}"; do
     i=$((idx - 1)); cur="${RI_PORT[$i]}"
-    if [ "${RI_LISTEN[$i]}" = "127.0.0.1" ] && [ "$cur" -ge "$MIN_PORT" ] && [ "$cur" -le "$MAX_PORT" ]; then
+    if is_routable_listen "${RI_LISTEN[$i]}" && [ "$cur" -ge "$MIN_PORT" ] && [ "$cur" -le "$MAX_PORT" ]; then
+      # already consolidated (loopback or tunnel IP) on an internal port - keep it
       TAKEN_PORTS["$cur"]=keep
       plan_port[$i]="$cur"
     else
@@ -986,8 +1025,8 @@ do_setup() {
   printf '%sPlanned changes%s\n' "$C_PURPLE" "$R"
   for idx in "${sel[@]}"; do
     i=$((idx - 1))
-    printf '  %-20s :%-6s ->  127.0.0.1:%-6s [%s]\n' \
-      "${RI_REMARK[$i]:0:20}" "${RI_PORT[$i]}" "${plan_port[$i]}" "${RI_SNI[$i]}"
+    printf '  %-20s :%-6s ->  %s:%-6s [%s]\n' \
+      "${RI_REMARK[$i]:0:20}" "${RI_PORT[$i]}" "$(backend_ip "${RI_LISTEN[$i]}")" "${plan_port[$i]}" "${RI_SNI[$i]}"
   done
   printf '  Link host                %s:443\n' "$PUBLIC_HOST"
   printf '  Panel via 443            %s%s\n' "$PANEL_ROUTE" "$([ "$PANEL_ROUTE" = yes ] && printf ' (%s -> :%s)' "$PANEL_HOST" "$(panel_port)")"
@@ -1006,7 +1045,12 @@ do_setup() {
 
   for idx in "${sel[@]}"; do
     i=$((idx - 1))
-    xsql "UPDATE inbounds SET listen='127.0.0.1', port=${plan_port[$i]} WHERE id=${RI_ID[$i]};"
+    if is_private_ip "${RI_LISTEN[$i]}"; then
+      # tunnel inbound: keep its listen IP, only change the port
+      xsql "UPDATE inbounds SET port=${plan_port[$i]} WHERE id=${RI_ID[$i]};"
+    else
+      xsql "UPDATE inbounds SET listen='127.0.0.1', port=${plan_port[$i]} WHERE id=${RI_ID[$i]};"
+    fi
     set_inbound_host "${RI_ID[$i]}" "$PUBLIC_HOST" "${RI_REMARK[$i]:-reality}"
   done
   ok "Database updated for ${#sel[@]} inbound(s) (mechanism: ${HOST_MECHANISM})."
@@ -1058,7 +1102,11 @@ do_sync() {
   local -a pending=()
   local i
   for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-    [ "${RI_LISTEN[$i]}" = "127.0.0.1" ] && continue
+    # Already done = routable listen AND already on an internal port.
+    if is_routable_listen "${RI_LISTEN[$i]}" \
+       && [ "${RI_PORT[$i]}" -ge "$MIN_PORT" ] && [ "${RI_PORT[$i]}" -le "$MAX_PORT" ]; then
+      continue
+    fi
     pending+=("$((i + 1))")
   done
 
@@ -1077,9 +1125,13 @@ do_sync() {
         i=$((idx - 1))
         alloc_port "" || break
         p="$ALLOC_PORT"
-        xsql "UPDATE inbounds SET listen='127.0.0.1', port=${p} WHERE id=${RI_ID[$i]};"
+        if is_private_ip "${RI_LISTEN[$i]}"; then
+          xsql "UPDATE inbounds SET port=${p} WHERE id=${RI_ID[$i]};"
+        else
+          xsql "UPDATE inbounds SET listen='127.0.0.1', port=${p} WHERE id=${RI_ID[$i]};"
+        fi
         [ -n "$PUBLIC_HOST" ] && set_inbound_host "${RI_ID[$i]}" "$PUBLIC_HOST" "${RI_REMARK[$i]:-reality}"
-        ok "${RI_REMARK[$i]} -> 127.0.0.1:${p}"
+        ok "${RI_REMARK[$i]} -> $(backend_ip "${RI_LISTEN[$i]}"):${p}"
       done
       systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
       load_inbounds
