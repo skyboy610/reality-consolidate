@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.7.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -390,9 +390,15 @@ sub_port()   { local p; p=$(get_setting subPort); [ -n "$p" ] || p="$DEFAULT_SUB
 panel_tls()  { [ -n "$(get_setting webCertFile)" ] && return 0 || return 1; }
 sub_tls()    { [ -n "$(get_setting subCertFile)" ] && return 0 || return 1; }
 
-SKIPPED_TUNNELS=0
+# Tunnel inbounds (Reality on a private IP): infrastructure for reverse/GRE.
+# Their listen/port are NEVER rewritten, and they are NEVER routed on 443.
+# They DO get a host row (private IP + their own real port) so the panel's
+# subscription Listen Domain does not overwrite the address shown in configs.
+declare -a TUN_ID=() TUN_REMARK=() TUN_LISTEN=() TUN_PORT=()
+
 load_inbounds() {
   RI_ID=(); RI_REMARK=(); RI_LISTEN=(); RI_PORT=(); RI_PROTO=(); RI_SNI=(); RI_NET=(); RI_STREAM=()
+  TUN_ID=(); TUN_REMARK=(); TUN_LISTEN=(); TUN_PORT=()
   SKIPPED_TUNNELS=0
   local json n i row sec __lst
   json=$(q "SELECT id, remark, listen, port, protocol, stream_settings FROM inbounds WHERE enable=1 OR enable IS NULL;")
@@ -401,11 +407,16 @@ load_inbounds() {
     row=$(printf '%s' "$json" | jq -c ".[$i]")
     sec=$(printf '%s' "$row" | jq -r '(.stream_settings // "{}") | fromjson? | .security // ""')
     [ "$sec" = "reality" ] || continue
-    # Skip inbounds bound to a private tunnel IP (GRE/WireGuard/reverse
-    # infrastructure). Touching these breaks reverse tunnels whose far end
-    # dials a fixed IP:port, so they are never listed, routed, or rewritten.
     __lst=$(printf '%s' "$row" | jq -r '.listen // ""')
-    if is_private_ip "$__lst"; then SKIPPED_TUNNELS=$((SKIPPED_TUNNELS + 1)); continue; fi
+    if is_private_ip "$__lst"; then
+      # tunnel inbound - track separately, never route or rewrite it
+      TUN_ID+=("$(printf '%s' "$row" | jq -r '.id')")
+      TUN_REMARK+=("$(printf '%s' "$row" | jq -r '.remark // ""')")
+      TUN_LISTEN+=("$__lst")
+      TUN_PORT+=("$(printf '%s' "$row" | jq -r '.port')")
+      SKIPPED_TUNNELS=$((SKIPPED_TUNNELS + 1))
+      continue
+    fi
     RI_ID+=("$(printf '%s' "$row" | jq -r '.id')")
     RI_REMARK+=("$(printf '%s' "$row" | jq -r '.remark // ""')")
     RI_LISTEN+=("$(printf '%s' "$row" | jq -r '.listen // ""')")
@@ -415,6 +426,17 @@ load_inbounds() {
     RI_NET+=("$(printf '%s' "$row" | jq -r '.stream_settings | fromjson | .network // "tcp"')")
     RI_STREAM+=("$(printf '%s' "$row" | jq -c '.stream_settings | fromjson')")
   done
+}
+
+# Give every tunnel inbound a host of "<its private IP>:<its real port>", so the
+# subscription Listen Domain does not bleed into its config address. Never
+# touches listen or port.
+apply_tunnel_hosts() {
+  local i
+  for ((i = 0; i < ${#TUN_ID[@]}; i++)); do
+    set_inbound_host "${TUN_ID[$i]}" "${TUN_LISTEN[$i]}" "${TUN_REMARK[$i]:-tunnel}" "${TUN_PORT[$i]}"
+  done
+  [ "${#TUN_ID[@]}" -gt 0 ] && ok "Set host on ${#TUN_ID[@]} tunnel inbound(s) so the subscription domain won't override them."
 }
 
 refresh_taken_ports() {
@@ -846,22 +868,22 @@ diagnose() {
 # Host / external address for generated links
 # ---------------------------------------------------------------------------
 set_inbound_host() {
-  local id="$1" addr="$2" remark="$3"
+  local id="$1" addr="$2" remark="$3" hport="${4:-443}"
   local ea er existing sj new
   ea=$(esc "$addr"); er=$(esc "$remark")
 
   if [ "$HOST_MECHANISM" = "hosts_table" ]; then
     existing=$(xsql "SELECT id FROM hosts WHERE inbound_id=${id} LIMIT 1;")
     if [ -n "$existing" ]; then
-      xsql "UPDATE hosts SET address='${ea}', port=443, remark='${er}' WHERE id=${existing};"
+      xsql "UPDATE hosts SET address='${ea}', port=${hport}, remark='${er}' WHERE id=${existing};"
     else
-      xsql "INSERT INTO hosts (inbound_id, remark, address, port, security) VALUES (${id}, '${er}', '${ea}', 443, 'same');" 2>/dev/null \
-      || xsql "INSERT INTO hosts (inbound_id, remark, address, port) VALUES (${id}, '${er}', '${ea}', 443);"
+      xsql "INSERT INTO hosts (inbound_id, remark, address, port, security) VALUES (${id}, '${er}', '${ea}', ${hport}, 'same');" 2>/dev/null \
+      || xsql "INSERT INTO hosts (inbound_id, remark, address, port) VALUES (${id}, '${er}', '${ea}', ${hport});"
     fi
   else
     sj=$(q "SELECT stream_settings FROM inbounds WHERE id=${id};" | jq -r '.[0].stream_settings')
-    new=$(printf '%s' "$sj" | jq -c --arg d "$addr" --arg r "$remark" \
-      '.externalProxy = [{forceTls:"same", dest:$d, port:443, remark:$r}]')
+    new=$(printf '%s' "$sj" | jq -c --arg d "$addr" --arg r "$remark" --argjson p "$hport" \
+      '.externalProxy = [{forceTls:"same", dest:$d, port:$p, remark:$r}]')
     xsql "UPDATE inbounds SET stream_settings='$(esc "$new")' WHERE id=${id};"
   fi
 }
@@ -1066,6 +1088,8 @@ do_setup() {
   done
   ok "Database updated for ${#sel[@]} inbound(s) (mechanism: ${HOST_MECHANISM})."
 
+  apply_tunnel_hosts
+
   systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
   sleep 1
   if systemctl is-active --quiet "$XUI_SERVICE"; then ok "${XUI_SERVICE} restarted."
@@ -1123,6 +1147,9 @@ do_sync() {
 
   if [ "${#pending[@]}" -eq 0 ]; then
     ok "All Reality inbounds are already routed. Regenerating nginx map only."
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+    apply_tunnel_hosts
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
   else
     show_table
     info "Not yet routed: ${#pending[@]} inbound(s)."
@@ -1144,6 +1171,7 @@ do_sync() {
         [ -n "$PUBLIC_HOST" ] && set_inbound_host "${RI_ID[$i]}" "$PUBLIC_HOST" "${RI_REMARK[$i]:-reality}"
         ok "${RI_REMARK[$i]} -> $(backend_ip "${RI_LISTEN[$i]}"):${p}"
       done
+      apply_tunnel_hosts
       systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
       load_inbounds
     fi
