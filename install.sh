@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.9.0"
+SCRIPT_VERSION="2.9.1"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -40,7 +40,7 @@ EXCLUDE_IDS=""   # space-separated inbound IDs marked as tunnels (never touched)
 # ---------------------------------------------------------------------------
 # Runtime tables
 # ---------------------------------------------------------------------------
-declare -a RI_ID=() RI_REMARK=() RI_LISTEN=() RI_PORT=() RI_PROTO=() RI_SNI=() RI_NET=() RI_STREAM=()
+declare -a RI_ID=() RI_REMARK=() RI_LISTEN=() RI_PORT=() RI_PROTO=() RI_SNI=() RI_SNIS=() RI_NET=() RI_STREAM=()
 declare -A TAKEN_PORTS=()
 HOST_MECHANISM=""
 PROMPT_IDX=0
@@ -404,7 +404,7 @@ sub_tls()    { [ -n "$(get_setting subCertFile)" ] && return 0 || return 1; }
 declare -a TUN_ID=() TUN_REMARK=() TUN_LISTEN=() TUN_PORT=()
 
 load_inbounds() {
-  RI_ID=(); RI_REMARK=(); RI_LISTEN=(); RI_PORT=(); RI_PROTO=(); RI_SNI=(); RI_NET=(); RI_STREAM=()
+  RI_ID=(); RI_REMARK=(); RI_LISTEN=(); RI_PORT=(); RI_PROTO=(); RI_SNI=(); RI_SNIS=(); RI_NET=(); RI_STREAM=()
   TUN_ID=(); TUN_REMARK=(); TUN_LISTEN=(); TUN_PORT=()
   SKIPPED_TUNNELS=0
   local json n i row sec __lst __id
@@ -431,6 +431,7 @@ load_inbounds() {
     RI_PORT+=("$(printf '%s' "$row" | jq -r '.port')")
     RI_PROTO+=("$(printf '%s' "$row" | jq -r '.protocol')")
     RI_SNI+=("$(printf '%s' "$row" | jq -r '.stream_settings | fromjson | .realitySettings.serverNames[0] // ""')")
+    RI_SNIS+=("$(printf '%s' "$row" | jq -r '.stream_settings | fromjson | (.realitySettings.serverNames // []) | join(" ")')")
     RI_NET+=("$(printf '%s' "$row" | jq -r '.stream_settings | fromjson | .network // "tcp"')")
     RI_STREAM+=("$(printf '%s' "$row" | jq -c '.stream_settings | fromjson')")
   done
@@ -689,7 +690,13 @@ write_stream_conf() {
     for ((i = 0; i < ${#RI_ID[@]}; i++)); do
       if is_routable_listen "${RI_LISTEN[$i]}" && [ -n "${RI_SNI[$i]}" ]; then
         bip=$(backend_ip "${RI_LISTEN[$i]}")
-        printf '    "%s" %s:%s;\n' "${RI_SNI[$i]}" "$bip" "${RI_PORT[$i]}"
+        # A Reality inbound can serve many serverNames, and a client link may
+        # use ANY of them - map every one to this inbound's backend, or the
+        # unlisted ones fall through to "default" and hit the wrong inbound.
+        local sn
+        for sn in ${RI_SNIS[$i]}; do
+          printf '    "%s" %s:%s;\n' "$sn" "$bip" "${RI_PORT[$i]}"
+        done
       fi
     done
     if [ "$PANEL_ROUTE" = "yes" ] && [ -n "$PANEL_HOST" ]; then
