@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.8.0"
+SCRIPT_VERSION="2.9.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -449,7 +449,10 @@ apply_tunnel_hosts() {
       done_n=$((done_n + 1))
     fi
   done
-  [ "$done_n" -gt 0 ] && ok "Set host on ${done_n} tunnel inbound(s) so the subscription domain won't override them."
+  if [ "$done_n" -gt 0 ]; then
+    ok "Set host on ${done_n} tunnel inbound(s) so the subscription domain won't override them."
+  fi
+  return 0
 }
 
 refresh_taken_ports() {
@@ -775,6 +778,49 @@ apply_nginx() {
   err "nginx config test failed. Restoring the previous nginx config."
   sed -n '1,40p' /tmp/r443.nginx.err >&2
   restore_nginx_from "$backup_dir"
+  return 1
+}
+
+# Wait until x-ui/xray binds every expected internal port, restarting x-ui once
+# if it stalls. $@ = list of ports that must become LISTEN. Returns 0 if all up.
+wait_for_ports() {
+  local -a want=("$@")
+  local p all i restarted=0
+  for ((i = 0; i < 30; i++)); do
+    all=1
+    for p in "${want[@]}"; do
+      port_busy "$p" || { all=0; break; }
+    done
+    if [ "$all" -eq 1 ]; then return 0; fi
+    # Halfway through, give x-ui a real restart - a plain start sometimes does
+    # not reload a DB whose ports changed underneath a lingering xray process.
+    if [ "$i" -eq 12 ] && [ "$restarted" -eq 0 ]; then
+      restarted=1
+      systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+start_xui_and_wait() {
+  # start_xui_and_wait PORT...  -> starts x-ui, waits for xray to bind PORTs
+  systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+  if [ "$#" -gt 0 ] && wait_for_ports "$@"; then
+    ok "${XUI_SERVICE} is up and xray is listening on the new port(s)."
+    return 0
+  fi
+  # No ports given, or they never came up: fall back to a status check.
+  if systemctl is-active --quiet "$XUI_SERVICE"; then
+    if [ "$#" -gt 0 ]; then
+      warn "${XUI_SERVICE} is running but xray has not bound all expected ports yet."
+      warn "If configs do not connect, run: systemctl restart ${XUI_SERVICE}"
+    else
+      ok "${XUI_SERVICE} restarted."
+    fi
+    return 0
+  fi
+  err "${XUI_SERVICE} failed to start - check 'systemctl status ${XUI_SERVICE}'."
   return 1
 }
 
@@ -1109,10 +1155,11 @@ do_setup() {
 
   apply_tunnel_hosts
 
-  systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-  sleep 1
-  if systemctl is-active --quiet "$XUI_SERVICE"; then ok "${XUI_SERVICE} restarted."
-  else err "${XUI_SERVICE} failed to start - check 'systemctl status ${XUI_SERVICE}'."; fi
+  # Collect the internal ports xray must now bind, and wait for them before
+  # writing the nginx map - otherwise nginx proxies to ports nothing is on yet.
+  local -a wait_ports=()
+  for idx in "${sel[@]}"; do wait_ports+=("${plan_port[$((idx - 1))]}"); done
+  start_xui_and_wait "${wait_ports[@]}"
 
   load_inbounds
   if ! write_stream_conf || ! hook_stream_include; then
@@ -1168,7 +1215,7 @@ do_sync() {
     ok "All Reality inbounds are already routed. Regenerating nginx map only."
     systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
     apply_tunnel_hosts
-    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+    start_xui_and_wait
   else
     show_table
     info "Not yet routed: ${#pending[@]} inbound(s)."
@@ -1178,6 +1225,7 @@ do_sync() {
       backup_now >/dev/null
       systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
       local idx p
+      local -a wait_ports=()
       for idx in "${pending[@]}"; do
         i=$((idx - 1))
         alloc_port "" || break
@@ -1189,9 +1237,10 @@ do_sync() {
         fi
         [ -n "$PUBLIC_HOST" ] && set_inbound_host "${RI_ID[$i]}" "$PUBLIC_HOST" "${RI_REMARK[$i]:-reality}"
         ok "${RI_REMARK[$i]} -> $(backend_ip "${RI_LISTEN[$i]}"):${p}"
+        wait_ports+=("$p")
       done
       apply_tunnel_hosts
-      systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+      start_xui_and_wait "${wait_ports[@]}"
       load_inbounds
     fi
   fi
