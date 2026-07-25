@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.9.1"
+SCRIPT_VERSION="2.9.2"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -35,7 +35,6 @@ PANEL_HOST=""
 SUB_HOST=""
 PANEL_ROUTE="no"
 SUB_ROUTE="no"
-EXCLUDE_IDS=""   # space-separated inbound IDs marked as tunnels (never touched)
 
 # ---------------------------------------------------------------------------
 # Runtime tables
@@ -149,12 +148,6 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Such inbounds keep their listen IP - we still reassign the port and route to
 # "<that IP>:<newport>" instead of 127.0.0.1, because the inbound is reachable
 # on a tunnel interface, not loopback.
-id_excluded() {
-  local id="$1" x
-  for x in $EXCLUDE_IDS; do [ "$x" = "$id" ] && return 0; done
-  return 1
-}
-
 is_private_ip() {
   local ip="$1"
   case "$ip" in
@@ -407,7 +400,7 @@ load_inbounds() {
   RI_ID=(); RI_REMARK=(); RI_LISTEN=(); RI_PORT=(); RI_PROTO=(); RI_SNI=(); RI_SNIS=(); RI_NET=(); RI_STREAM=()
   TUN_ID=(); TUN_REMARK=(); TUN_LISTEN=(); TUN_PORT=()
   SKIPPED_TUNNELS=0
-  local json n i row sec __lst __id
+  local json n i row sec __lst
   json=$(q "SELECT id, remark, listen, port, protocol, stream_settings FROM inbounds WHERE enable=1 OR enable IS NULL;")
   n=$(printf '%s' "$json" | jq 'length')
   for ((i = 0; i < n; i++)); do
@@ -415,10 +408,9 @@ load_inbounds() {
     sec=$(printf '%s' "$row" | jq -r '(.stream_settings // "{}") | fromjson? | .security // ""')
     [ "$sec" = "reality" ] || continue
     __lst=$(printf '%s' "$row" | jq -r '.listen // ""')
-    __id=$(printf '%s' "$row" | jq -r '.id')
-    if is_private_ip "$__lst" || id_excluded "$__id"; then
-      # tunnel / user-excluded inbound - track separately, never route or rewrite
-      TUN_ID+=("$__id")
+    if is_private_ip "$__lst"; then
+      # tunnel inbound (private IP) - track separately, never route or rewrite
+      TUN_ID+=("$(printf '%s' "$row" | jq -r '.id')")
       TUN_REMARK+=("$(printf '%s' "$row" | jq -r '.remark // ""')")
       TUN_LISTEN+=("$__lst")
       TUN_PORT+=("$(printf '%s' "$row" | jq -r '.port')")
@@ -500,14 +492,13 @@ load_state() {
   SUB_HOST=$(jq -r '.sub_host // ""' "$STATE_FILE")
   PANEL_ROUTE=$(jq -r '.panel_route // "no"' "$STATE_FILE")
   SUB_ROUTE=$(jq -r '.sub_route // "no"' "$STATE_FILE")
-  EXCLUDE_IDS=$(jq -r '.exclude_ids // ""' "$STATE_FILE")
 }
 
 save_state() {
   mkdir -p "$STATE_DIR"
   jq -n --arg ph "$PUBLIC_HOST" --arg pa "$PANEL_HOST" --arg su "$SUB_HOST" \
-        --arg pr "$PANEL_ROUTE" --arg sr "$SUB_ROUTE" --arg ex "$EXCLUDE_IDS" \
-    '{public_host:$ph, panel_host:$pa, sub_host:$su, panel_route:$pr, sub_route:$sr, exclude_ids:$ex}' > "$STATE_FILE"
+        --arg pr "$PANEL_ROUTE" --arg sr "$SUB_ROUTE" \
+    '{public_host:$ph, panel_host:$pa, sub_host:$su, panel_route:$pr, sub_route:$sr}' > "$STATE_FILE"
 }
 
 save_original_ports() {
@@ -1426,72 +1417,28 @@ do_remove() {
 # ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
-mark_tunnels() {
-  header
-  db_ready || { pause; return 0; }
-  load_state
-  # show ALL reality inbounds (routable + already-excluded) with real IDs
-  local json n i id rem lst prt sec
-  json=$(q "SELECT id, remark, listen, port, stream_settings FROM inbounds WHERE enable=1 OR enable IS NULL;")
-  n=$(printf '%s' "$json" | jq 'length')
-  printf '%s %-5s %-22s %-16s %-7s %s%s\n' "$C_TURQ" "ID" "REMARK" "LISTEN" "PORT" "EXCLUDED" "$R"
-  printf '%s%s%s\n' "$C_GRAY" "-----------------------------------------------------------------" "$R"
-  for ((i = 0; i < n; i++)); do
-    sec=$(printf '%s' "$json" | jq -r ".[$i].stream_settings | fromjson? | .security // \"\"")
-    [ "$sec" = "reality" ] || continue
-    id=$(printf '%s' "$json" | jq -r ".[$i].id")
-    rem=$(printf '%s' "$json" | jq -r ".[$i].remark // \"\"")
-    lst=$(printf '%s' "$json" | jq -r ".[$i].listen // \"\"")
-    prt=$(printf '%s' "$json" | jq -r ".[$i].port")
-    if id_excluded "$id"; then ex="yes"; else ex="no"; fi
-    printf ' %-5s %-22s %-16s %-7s %s\n' "$id" "${rem:0:22}" "${lst:-0.0.0.0}" "$prt" "$ex"
-  done
-  echo
-  info "Excluded inbounds are treated as tunnels: never routed, never rewritten."
-  info "Enter inbound IDs to toggle (space-separated), or press Enter to cancel."
-  local raw; printf '%sIDs to toggle%s: ' "$(next_c)" "$R"; IFS= read -r raw || raw=""
-  [ -z "$raw" ] && { warn "No change."; pause; return 0; }
-  local tok
-  for tok in $raw; do
-    if ! [[ "$tok" =~ ^[0-9]+$ ]]; then err "'$tok' is not an ID."; continue; fi
-    if id_excluded "$tok"; then
-      EXCLUDE_IDS=$(printf '%s' "$EXCLUDE_IDS" | tr ' ' '\n' | grep -vx "$tok" | tr '\n' ' ')
-      ok "Inbound $tok is no longer excluded."
-    else
-      EXCLUDE_IDS="${EXCLUDE_IDS} ${tok}"
-      ok "Inbound $tok marked as tunnel (excluded)."
-    fi
-  done
-  EXCLUDE_IDS=$(printf '%s' "$EXCLUDE_IDS" | xargs)  # normalise spaces
-  save_state
-  info "Current excluded IDs: ${EXCLUDE_IDS:-<none>}"
-  pause
-}
-
 main_menu() {
   while true; do
     header
     line_c 0 "1) Setup 443 Routing"
     line_c 1 "2) Sync New Inbounds"
-    line_c 2 "3) Mark Tunnel Inbounds (exclude)"
-    line_c 3 "4) Panel and Ports"
-    line_c 4 "5) Services"
-    line_c 5 "6) Diagnose"
-    line_c 6 "7) Rollback Last Change"
-    line_c 7 "8) Remove 443 Routing"
-    line_c 8 "0) Exit"
+    line_c 2 "3) Panel and Ports"
+    line_c 3 "4) Services"
+    line_c 4 "5) Diagnose"
+    line_c 5 "6) Rollback Last Change"
+    line_c 6 "7) Remove 443 Routing"
+    line_c 7 "0) Exit"
     local ch
     printf '%sChoice%s: ' "$(next_c)" "$R"
     IFS= read -r ch || ch=0
     case "$ch" in
       1) do_setup ;;
       2) do_sync ;;
-      3) mark_tunnels ;;
-      4) panel_menu ;;
-      5) services_menu ;;
-      6) diagnose ;;
-      7) do_rollback ;;
-      8) do_remove ;;
+      3) panel_menu ;;
+      4) services_menu ;;
+      5) diagnose ;;
+      6) do_rollback ;;
+      7) do_remove ;;
       0) clear; exit 0 ;;
       *) err "Pick a number from the list."; pause ;;
     esac
