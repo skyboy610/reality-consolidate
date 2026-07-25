@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.9.2"
+SCRIPT_VERSION="3.0.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -352,7 +352,15 @@ http_binds_443() {
 # ---------------------------------------------------------------------------
 esc() { printf '%s' "$1" | sed "s/'/''/g"; }
 q()   { sqlite3 -json "$DB_PATH" "$1"; }
-xsql() { sqlite3 "$DB_PATH" "$1"; }
+# All writes go through xsql: a 5s busy-timeout waits out x-ui's lock instead of
+# silently racing it, and a WAL checkpoint flushes the change into the main DB
+# file so the panel/xray actually see it.
+xsql() {
+  # PRAGMA busy_timeout (SQL) - NOT the ".timeout" dot-command, which does not
+  # compose with SQL in a single batch and silently swallows the statement.
+  # wal_checkpoint flushes the write into the main DB so x-ui/panel see it.
+  sqlite3 "$DB_PATH" "PRAGMA busy_timeout=5000; $1 PRAGMA wal_checkpoint(TRUNCATE);"
+}
 
 db_ready() {
   [ -f "$DB_PATH" ] || { err "Database not found at ${DB_PATH}"; return 1; }
@@ -1417,28 +1425,91 @@ do_remove() {
 # ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
+manage_hosts() {
+  while true; do
+    header
+    db_ready || { pause; return 0; }
+    local json n i id iid addr prt rem
+    json=$(q "SELECT h.id, h.inbound_id, h.address, h.port, h.remark, i.remark AS ib FROM hosts h LEFT JOIN inbounds i ON i.id=h.inbound_id ORDER BY h.id;")
+    n=$(printf '%s' "$json" | jq 'length')
+    printf '%s %-5s %-8s %-22s %-7s %s%s\n' "$C_TURQ" "HOSTID" "INBOUND" "ADDRESS" "PORT" "INBOUND REMARK" "$R"
+    printf '%s%s%s\n' "$C_GRAY" "----------------------------------------------------------------" "$R"
+    if [ "$n" -eq 0 ]; then
+      info "No host rows in the database."
+    else
+      for ((i = 0; i < n; i++)); do
+        id=$(printf '%s' "$json" | jq -r ".[$i].id")
+        iid=$(printf '%s' "$json" | jq -r ".[$i].inbound_id")
+        addr=$(printf '%s' "$json" | jq -r ".[$i].address // \"\"")
+        prt=$(printf '%s' "$json" | jq -r ".[$i].port")
+        rem=$(printf '%s' "$json" | jq -r ".[$i].ib // \"\"")
+        printf ' %-5s %-8s %-22s %-7s %s\n' "$id" "$iid" "${addr:0:22}" "$prt" "${rem:0:20}"
+      done
+    fi
+    echo
+    line_c 0 "1) Delete host(s) by HOSTID"
+    line_c 1 "2) Delete ALL hosts"
+    line_c 2 "0) Back"
+    local ch
+    printf '%sChoice%s: ' "$(next_c)" "$R"
+    IFS= read -r ch || ch=0
+    case "$ch" in
+      1)
+        [ "$n" -eq 0 ] && { warn "Nothing to delete."; pause; continue; }
+        local raw; printf '%sHOSTIDs to delete (space-separated)%s: ' "$(next_c)" "$R"; IFS= read -r raw || raw=""
+        [ -z "$raw" ] && { warn "No change."; pause; continue; }
+        backup_now >/dev/null
+        local tok deleted=0
+        for tok in $raw; do
+          if [[ "$tok" =~ ^[0-9]+$ ]]; then
+            xsql "DELETE FROM hosts WHERE id=${tok};"
+            deleted=$((deleted + 1))
+          else
+            err "'$tok' is not a HOSTID."
+          fi
+        done
+        systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
+        ok "Deleted ${deleted} host row(s) and restarted ${XUI_SERVICE}."
+        pause ;;
+      2)
+        [ "$n" -eq 0 ] && { warn "Nothing to delete."; pause; continue; }
+        local c; c=$(ask "Delete ALL ${n} host row(s)? [y/N]" v_yn "no")
+        [ "$c" = "yes" ] || { warn "Cancelled."; pause; continue; }
+        backup_now >/dev/null
+        xsql "DELETE FROM hosts;"
+        systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
+        ok "All host rows deleted and ${XUI_SERVICE} restarted."
+        pause ;;
+      0) return 0 ;;
+      *) err "Pick a number from the list."; pause ;;
+    esac
+  done
+}
+
 main_menu() {
   while true; do
     header
     line_c 0 "1) Setup 443 Routing"
     line_c 1 "2) Sync New Inbounds"
-    line_c 2 "3) Panel and Ports"
-    line_c 3 "4) Services"
-    line_c 4 "5) Diagnose"
-    line_c 5 "6) Rollback Last Change"
-    line_c 6 "7) Remove 443 Routing"
-    line_c 7 "0) Exit"
+    line_c 2 "3) Manage Hosts"
+    line_c 3 "4) Panel and Ports"
+    line_c 4 "5) Services"
+    line_c 5 "6) Diagnose"
+    line_c 6 "7) Rollback Last Change"
+    line_c 7 "8) Remove 443 Routing"
+    line_c 8 "0) Exit"
     local ch
     printf '%sChoice%s: ' "$(next_c)" "$R"
     IFS= read -r ch || ch=0
     case "$ch" in
       1) do_setup ;;
       2) do_sync ;;
-      3) panel_menu ;;
-      4) services_menu ;;
-      5) diagnose ;;
-      6) do_rollback ;;
-      7) do_remove ;;
+      3) manage_hosts ;;
+      4) panel_menu ;;
+      5) services_menu ;;
+      6) diagnose ;;
+      7) do_rollback ;;
+      8) do_remove ;;
       0) clear; exit 0 ;;
       *) err "Pick a number from the list."; pause ;;
     esac
