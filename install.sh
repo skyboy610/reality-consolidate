@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.0.2"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -355,11 +355,23 @@ q()   { sqlite3 -json "$DB_PATH" "$1"; }
 # All writes go through xsql: a 5s busy-timeout waits out x-ui's lock instead of
 # silently racing it, and a WAL checkpoint flushes the change into the main DB
 # file so the panel/xray actually see it.
+# .timeout is passed as a -cmd DOT-COMMAND (not inline SQL): inline ".timeout"
+# swallows the following statement, and inline "PRAGMA busy_timeout" echoes its
+# value into the output. As a -cmd flag it does neither - it just waits out
+# x-ui's lock silently.
+#
+# Write helper: runs a write statement then flushes WAL into the main DB file
+# so the panel/xray actually see the change. Use xsql ONLY for writes.
 xsql() {
-  # PRAGMA busy_timeout (SQL) - NOT the ".timeout" dot-command, which does not
-  # compose with SQL in a single batch and silently swallows the statement.
-  # wal_checkpoint flushes the write into the main DB so x-ui/panel see it.
-  sqlite3 "$DB_PATH" "PRAGMA busy_timeout=5000; $1 PRAGMA wal_checkpoint(TRUNCATE);"
+  sqlite3 -cmd ".timeout 5000" "$DB_PATH" "$1" >/dev/null 2>&1
+  sqlite3 "$DB_PATH" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1
+  return 0
+}
+
+# Read helper: returns a clean scalar/plain value (no PRAGMA noise). Use for
+# SELECTs whose result is captured into a variable.
+xval() {
+  sqlite3 -cmd ".timeout 5000" "$DB_PATH" "$1"
 }
 
 db_ready() {
@@ -370,7 +382,7 @@ db_ready() {
 }
 
 detect_host_mechanism() {
-  if xsql "SELECT name FROM sqlite_master WHERE type='table' AND name='hosts';" | grep -q '^hosts$'; then
+  if xval "SELECT name FROM sqlite_master WHERE type='table' AND name='hosts';" | grep -q '^hosts$'; then
     HOST_MECHANISM="hosts_table"
   else
     HOST_MECHANISM="external_proxy"
@@ -385,7 +397,7 @@ get_setting() {
 set_setting() {
   local k v ek ev exists
   k="$1"; v="$2"; ek=$(esc "$k"); ev=$(esc "$v")
-  exists=$(xsql "SELECT COUNT(*) FROM settings WHERE key='${ek}';")
+  exists=$(xval "SELECT COUNT(*) FROM settings WHERE key='${ek}';")
   if [ "$exists" -gt 0 ]; then
     xsql "UPDATE settings SET value='${ev}' WHERE key='${ek}';"
   else
@@ -459,7 +471,7 @@ apply_tunnel_hosts() {
 refresh_taken_ports() {
   TAKEN_PORTS=()
   local p
-  while IFS= read -r p; do [ -n "$p" ] && TAKEN_PORTS["$p"]=db; done < <(xsql "SELECT port FROM inbounds;")
+  while IFS= read -r p; do [ -n "$p" ] && TAKEN_PORTS["$p"]=db; done < <(xval "SELECT port FROM inbounds;")
   TAKEN_PORTS["$(panel_port)"]=panel
   TAKEN_PORTS["$(sub_port)"]=sub
 }
@@ -944,7 +956,7 @@ set_inbound_host() {
   ea=$(esc "$addr"); er=$(esc "$remark")
 
   if [ "$HOST_MECHANISM" = "hosts_table" ]; then
-    existing=$(xsql "SELECT id FROM hosts WHERE inbound_id=${id} LIMIT 1;")
+    existing=$(xval "SELECT id FROM hosts WHERE inbound_id=${id} LIMIT 1;")
     if [ -n "$existing" ]; then
       xsql "UPDATE hosts SET address='${ea}', port=${hport}, remark='${er}' WHERE id=${existing};"
     else
