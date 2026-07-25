@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="2.5.2"
+SCRIPT_VERSION="2.6.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -390,15 +390,22 @@ sub_port()   { local p; p=$(get_setting subPort); [ -n "$p" ] || p="$DEFAULT_SUB
 panel_tls()  { [ -n "$(get_setting webCertFile)" ] && return 0 || return 1; }
 sub_tls()    { [ -n "$(get_setting subCertFile)" ] && return 0 || return 1; }
 
+SKIPPED_TUNNELS=0
 load_inbounds() {
   RI_ID=(); RI_REMARK=(); RI_LISTEN=(); RI_PORT=(); RI_PROTO=(); RI_SNI=(); RI_NET=(); RI_STREAM=()
-  local json n i row sec
+  SKIPPED_TUNNELS=0
+  local json n i row sec __lst
   json=$(q "SELECT id, remark, listen, port, protocol, stream_settings FROM inbounds WHERE enable=1 OR enable IS NULL;")
   n=$(printf '%s' "$json" | jq 'length')
   for ((i = 0; i < n; i++)); do
     row=$(printf '%s' "$json" | jq -c ".[$i]")
     sec=$(printf '%s' "$row" | jq -r '(.stream_settings // "{}") | fromjson? | .security // ""')
     [ "$sec" = "reality" ] || continue
+    # Skip inbounds bound to a private tunnel IP (GRE/WireGuard/reverse
+    # infrastructure). Touching these breaks reverse tunnels whose far end
+    # dials a fixed IP:port, so they are never listed, routed, or rewritten.
+    __lst=$(printf '%s' "$row" | jq -r '.listen // ""')
+    if is_private_ip "$__lst"; then SKIPPED_TUNNELS=$((SKIPPED_TUNNELS + 1)); continue; fi
     RI_ID+=("$(printf '%s' "$row" | jq -r '.id')")
     RI_REMARK+=("$(printf '%s' "$row" | jq -r '.remark // ""')")
     RI_LISTEN+=("$(printf '%s' "$row" | jq -r '.listen // ""')")
@@ -554,6 +561,10 @@ show_table() {
       "$((i + 1))" "${RI_REMARK[$i]:0:20}" "${RI_PORT[$i]}" \
       "${RI_NET[$i]}" "$on" "${RI_SNI[$i]}"
   done
+  if [ "${SKIPPED_TUNNELS:-0}" -gt 0 ]; then
+    printf '%s(%s tunnel inbound(s) on private IPs are intentionally left untouched)%s\n' \
+      "$C_GRAY" "$SKIPPED_TUNNELS" "$R"
+  fi
   echo
 }
 
