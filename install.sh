@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.0.2"
+SCRIPT_VERSION="3.1.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -148,6 +148,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Such inbounds keep their listen IP - we still reassign the port and route to
 # "<that IP>:<newport>" instead of 127.0.0.1, because the inbound is reachable
 # on a tunnel interface, not loopback.
+# True if an inbound's remark marks it as a tunnel (contains "tunnel", any case).
+is_tunnel_remark() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    *tunnel*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_private_ip() {
   local ip="$1"
   case "$ip" in
@@ -420,7 +428,7 @@ load_inbounds() {
   RI_ID=(); RI_REMARK=(); RI_LISTEN=(); RI_PORT=(); RI_PROTO=(); RI_SNI=(); RI_SNIS=(); RI_NET=(); RI_STREAM=()
   TUN_ID=(); TUN_REMARK=(); TUN_LISTEN=(); TUN_PORT=()
   SKIPPED_TUNNELS=0
-  local json n i row sec __lst
+  local json n i row sec __lst __rem
   json=$(q "SELECT id, remark, listen, port, protocol, stream_settings FROM inbounds WHERE enable=1 OR enable IS NULL;")
   n=$(printf '%s' "$json" | jq 'length')
   for ((i = 0; i < n; i++)); do
@@ -428,10 +436,13 @@ load_inbounds() {
     sec=$(printf '%s' "$row" | jq -r '(.stream_settings // "{}") | fromjson? | .security // ""')
     [ "$sec" = "reality" ] || continue
     __lst=$(printf '%s' "$row" | jq -r '.listen // ""')
-    if is_private_ip "$__lst"; then
-      # tunnel inbound (private IP) - track separately, never route or rewrite
+    __rem=$(printf '%s' "$row" | jq -r '.remark // ""')
+    # A tunnel inbound is one whose remark contains "tunnel" (any case), or that
+    # listens on a private/RFC1918 IP (a GRE/WireGuard tunnel address). These
+    # carry the reverse tunnel and must NEVER be routed on 443 or rewritten.
+    if is_tunnel_remark "$__rem" || is_private_ip "$__lst"; then
       TUN_ID+=("$(printf '%s' "$row" | jq -r '.id')")
-      TUN_REMARK+=("$(printf '%s' "$row" | jq -r '.remark // ""')")
+      TUN_REMARK+=("$__rem")
       TUN_LISTEN+=("$__lst")
       TUN_PORT+=("$(printf '%s' "$row" | jq -r '.port')")
       SKIPPED_TUNNELS=$((SKIPPED_TUNNELS + 1))
