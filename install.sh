@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.3.1"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -236,6 +236,26 @@ ensure_deps() {
 # ---------------------------------------------------------------------------
 # nginx install / stream module
 # ---------------------------------------------------------------------------
+# nginx may be built with a prefix other than /etc/nginx (or the package may be
+# installed while its config tree is missing). Ask the binary where its config
+# actually lives and re-point every derived path at it.
+sync_nginx_paths() {
+  have nginx || return 0
+  local cp dir
+  cp=$(nginx -V 2>&1 | grep -oE -- '--conf-path=[^ ]+' | head -n1 | cut -d= -f2 || true)
+  [ -n "$cp" ] || cp="$NGINX_CONF"
+  dir=$(dirname "$cp")
+  if [ "$cp" != "$NGINX_CONF" ] || [ ! -d "$dir" ]; then
+    NGINX_CONF="$cp"
+    NGINX_DIR="$dir"
+    STREAM_FILE="${NGINX_DIR}/stream-reality443.conf"
+    SITE_CONF="${NGINX_DIR}/conf.d/reality443-site.conf"
+    info "Using nginx config path: ${NGINX_CONF}"
+  fi
+  mkdir -p "$NGINX_DIR" "${NGINX_DIR}/conf.d"
+  return 0
+}
+
 stream_state() {
   local v
   v=$(nginx -V 2>&1 || true)
@@ -307,6 +327,46 @@ install_nginx() {
   else
     ok "nginx already present."
   fi
+
+  sync_nginx_paths
+  if [ ! -f "$NGINX_CONF" ]; then
+    warn "${NGINX_CONF} is missing - reinstalling nginx to restore its config."
+    case "$(pkg_mgr)" in
+      apt) DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall nginx-common nginx >/dev/null 2>&1 || true ;;
+      dnf|yum) install_pkgs nginx >/dev/null 2>&1 || true ;;
+    esac
+    sync_nginx_paths
+  fi
+  if [ ! -f "$NGINX_CONF" ]; then
+    # Last resort: write a minimal but valid nginx.conf so we have something to
+    # hook the stream block into.
+    warn "Still no nginx.conf - creating a minimal one at ${NGINX_CONF}."
+    mkdir -p "$NGINX_DIR" "${NGINX_DIR}/conf.d"
+    cat > "$NGINX_CONF" <<'NGCONF'
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    sendfile on;
+    tcp_nopush on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+    include /etc/nginx/conf.d/*.conf;
+}
+NGCONF
+    [ -f "${NGINX_DIR}/mime.types" ] || printf 'types {\n    text/html html htm;\n    text/css css;\n    application/javascript js;\n    image/png png;\n    image/jpeg jpg jpeg;\n    image/svg+xml svg;\n}\n' > "${NGINX_DIR}/mime.types"
+    mkdir -p /var/log/nginx
+  fi
+  [ -f "$NGINX_CONF" ] || { err "Cannot create ${NGINX_CONF}."; return 1; }
 
   local st so
   st=$(stream_state)
@@ -595,6 +655,14 @@ v_domain() {
   return 1
 }
 
+v_site_choice() {
+  case "$1" in
+    1|2|3) printf '%s\n' "$1"; return 0 ;;
+  esac
+  err "Enter 1, 2 or 3."
+  return 1
+}
+
 v_yn() {
   local x; x=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
   case "$x" in y|yes) echo yes; return 0 ;; n|no|"") echo no; return 0 ;; esac
@@ -758,7 +826,13 @@ write_stream_conf() {
     echo "    proxy_connect_timeout 5s;"
     echo "}"
   } > "$tmp"
-  mv "$tmp" "$STREAM_FILE"
+  mkdir -p "$(dirname "$STREAM_FILE")" 2>/dev/null || true
+  if ! mv "$tmp" "$STREAM_FILE" 2>/tmp/r443.mv.err; then
+    err "Could not write ${STREAM_FILE}:"
+    sed -n '1,5p' /tmp/r443.mv.err >&2
+    rm -f "$tmp"
+    return 1
+  fi
   ok "Wrote ${STREAM_FILE}"
 }
 
@@ -783,14 +857,26 @@ hook_stream_include() {
     return 1
   fi
 
-  {
+  if [ ! -f "$NGINX_CONF" ]; then
+    err "${NGINX_CONF} does not exist - cannot add the stream block."
+    return 1
+  fi
+  if ! {
     echo ""
     echo "$MARK_BEGIN"
     echo "stream {"
     echo "    include ${STREAM_FILE};"
     echo "}"
     echo "$MARK_END"
-  } >> "$NGINX_CONF"
+  } >> "$NGINX_CONF" 2>/tmp/r443.hook.err; then
+    err "Could not write to ${NGINX_CONF}:"
+    sed -n '1,5p' /tmp/r443.hook.err >&2
+    return 1
+  fi
+  if ! grep -qF "$MARK_BEGIN" "$NGINX_CONF"; then
+    err "Stream block did not persist in ${NGINX_CONF}."
+    return 1
+  fi
   ok "Added a top-level stream {} block to nginx.conf"
 }
 
@@ -1151,6 +1237,15 @@ do_setup() {
     SUB_HOST=""
   fi
 
+  # Camouflage site on port 80 - all questions asked here so a fresh install is
+  # one uninterrupted pass; the site itself is applied after 443 is live.
+  local site_choice
+  site_choice=$(ask "Camouflage site on port 80? 1=local files 2=redirect 3=skip" v_site_choice "3")
+  case "$site_choice" in
+    1) site_pick_local || site_choice=3 ;;
+    2) site_ask_redirect || site_choice=3 ;;
+  esac
+
   # Plan internal ports
   local -a plan_port=()
   local idx i cur
@@ -1176,6 +1271,11 @@ do_setup() {
   printf '  Link host                %s:443\n' "$PUBLIC_HOST"
   printf '  Panel via 443            %s%s\n' "$PANEL_ROUTE" "$([ "$PANEL_ROUTE" = yes ] && printf ' (%s -> :%s)' "$PANEL_HOST" "$(panel_port)")"
   printf '  Subscription via 443     %s%s\n' "$SUB_ROUTE" "$([ "$SUB_ROUTE" = yes ] && printf ' (%s -> :%s)' "$SUB_HOST" "$(sub_port)")"
+  case "$site_choice" in
+    1) printf '  Site on :80              local files from %s\n' "$SITE_SRC" ;;
+    2) printf '  Site on :80              redirect to https://%s\n' "$SITE_TARGET" ;;
+    *) printf '  Site on :80              none\n' ;;
+  esac
   echo
   warn "Existing users will be disconnected until they get updated links."
   local go; go=$(ask "Apply now? [y/N]" v_yn "no")
@@ -1220,6 +1320,11 @@ do_setup() {
     pause; return 0
   fi
   verify_live || true
+
+  case "$site_choice" in
+    1) echo; site_apply_local || warn "Camouflage site was not set up." ;;
+    2) echo; site_apply_redirect || warn "Camouflage site was not set up." ;;
+  esac
 
   echo
   printf '%sSample links%s\n' "$C_PURPLE" "$R"
@@ -1643,7 +1748,7 @@ site_menu() {
     printf '%sChoice%s: ' "$(next_c)" "$R"
     IFS= read -r ch || ch=0
     case "$ch" in
-      1) site_setup_local; pause ;;
+      1) site_pick_local && site_apply_local; pause ;;
       2) site_setup_redirect; pause ;;
       3) site_disable; pause ;;
       0) return 0 ;;
@@ -1652,7 +1757,10 @@ site_menu() {
   done
 }
 
-site_setup_local() {
+# Phase 1: pick the source index.html. Sets SITE_SRC. Asked up front so the
+# whole install is one uninterrupted run of questions.
+SITE_SRC=""
+site_pick_local() {
   local -a cands=()
   mapfile -t cands < <(find_index_candidates)
   local src=""
@@ -1686,7 +1794,18 @@ site_setup_local() {
       err "File not found: ${src:-<empty>}"
     done
   fi
+  SITE_SRC="$src"
+  return 0
+}
 
+# Phase 2: copy the chosen site into place and activate it.
+# shellcheck disable=SC2120  # optional arg, normally uses SITE_SRC
+site_apply_local() {
+  local src="${1:-$SITE_SRC}"
+  if [ -z "$src" ] || [ ! -f "$src" ]; then
+    err "No source index.html selected."
+    return 1
+  fi
   mkdir -p "$SITE_ROOT"
   # Copy the whole directory so CSS/JS/images next to index.html come along.
   local srcdir; srcdir=$(dirname "$src")
@@ -1705,13 +1824,24 @@ site_setup_local() {
   info "Visit http://${PUBLIC_HOST:-<your-domain>} to check it."
 }
 
-site_setup_redirect() {
+site_ask_redirect() {
   local dom
   dom=$(ask "Site to redirect to (no https://)" v_bare_domain "$SITE_TARGET")
-  SITE_TARGET="$dom"; SITE_MODE="redirect"
+  SITE_TARGET="$dom"
+  return 0
+}
+
+site_apply_redirect() {
+  [ -n "$SITE_TARGET" ] || { err "No redirect target set."; return 1; }
+  SITE_MODE="redirect"
   save_state
   apply_site || return 1
   info "Port 80 now redirects to https://${SITE_TARGET}"
+}
+
+site_setup_redirect() {
+  site_ask_redirect || return 1
+  site_apply_redirect
 }
 
 site_disable() {
