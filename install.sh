@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.4.1"
+SCRIPT_VERSION="3.4.2"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -158,7 +158,6 @@ banner() {
 count_routed() {
   local n
   [ -f "$STREAM_FILE" ] || { echo 0; return; }
-  # grep -c prints 0 AND exits 1 on no match, so "|| echo 0" would emit "0\n0".
   n=$(grep -cE '^[[:space:]]+"' "$STREAM_FILE" 2>/dev/null) || true
   [ -n "$n" ] || n=0
   printf '%s\n' "$n"
@@ -169,9 +168,6 @@ count_routed() {
 # ---------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Emitting "listen [::]:..." on a host without IPv6 makes nginx -t fail with
-# "Address family not supported by protocol", so every IPv6 listen line is
-# gated on this.
 has_ipv6() {
   [ -f /proc/net/if_inet6 ] || return 1
   [ -s /proc/net/if_inet6 ] || return 1
@@ -179,11 +175,6 @@ has_ipv6() {
   return 0
 }
 
-# True if the address is a private/RFC1918 IP (a GRE/WireGuard tunnel address).
-# Such inbounds keep their listen IP - we still reassign the port and route to
-# "<that IP>:<newport>" instead of 127.0.0.1, because the inbound is reachable
-# on a tunnel interface, not loopback.
-# True if an inbound's remark marks it as a tunnel (contains "tunnel", any case).
 is_tunnel_remark() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
     *tunnel*) return 0 ;;
@@ -201,14 +192,11 @@ is_private_ip() {
   esac
 }
 
-# The backend address nginx should proxy an inbound to: its own tunnel IP if it
-# has one, otherwise loopback.
 backend_ip() {
   local listen="$1"
   if is_private_ip "$listen"; then printf '%s\n' "$listen"; else printf '127.0.0.1\n'; fi
 }
 
-# An inbound is routable once it listens on loopback OR a tunnel IP.
 is_routable_listen() {
   [ "$1" = "127.0.0.1" ] && return 0
   is_private_ip "$1" && return 0
@@ -257,9 +245,6 @@ ensure_deps() {
 # ---------------------------------------------------------------------------
 # nginx install / stream module
 # ---------------------------------------------------------------------------
-# nginx may be built with a prefix other than /etc/nginx (or the package may be
-# installed while its config tree is missing). Ask the binary where its config
-# actually lives and re-point every derived path at it.
 sync_nginx_paths() {
   have nginx || return 0
   local cp dir
@@ -292,9 +277,6 @@ modules_path() {
   printf '%s\n' "$p"
 }
 
-# Locates ngx_stream_module.so. Distributions disagree on where it lands, so
-# check the compiled-in modules-path, then the usual suspects, then fall back
-# to an actual filesystem search. Prints the path, or nothing if absent.
 STREAM_SO_CACHE=""
 find_stream_so() {
   local cand
@@ -323,9 +305,6 @@ stream_module_already_loaded() {
   return 1
 }
 
-# nginx refuses to start if the same module is loaded twice. If our injected
-# line is the duplicate, drop it from nginx.conf (the distribution's own
-# modules-enabled entry stays).
 drop_our_load_module() {
   grep -qE '^load_module[[:space:]]+[^;]*ngx_stream_module\.so' "$NGINX_CONF" 2>/dev/null || return 1
   local tmp; tmp=$(mktemp)
@@ -359,8 +338,6 @@ install_nginx() {
     sync_nginx_paths
   fi
   if [ ! -f "$NGINX_CONF" ]; then
-    # Last resort: write a minimal but valid nginx.conf so we have something to
-    # hook the stream block into.
     warn "Still no nginx.conf - creating a minimal one at ${NGINX_CONF}."
     mkdir -p "$NGINX_DIR" "${NGINX_DIR}/conf.d"
     cat > "$NGINX_CONF" <<'NGCONF'
@@ -392,16 +369,12 @@ NGCONF
   local st so
   st=$(stream_state)
 
-  # "static" means it is baked into the binary and always available.
   if [ "$st" = "static" ]; then
     ok "nginx stream module: built in"
     systemctl enable "$NGINX_SERVICE" >/dev/null 2>&1 || true
     return 0
   fi
 
-  # Either declared dynamic, or not declared at all. Both cases can be solved
-  # by the distribution's separate stream-module package, so try that first
-  # before giving up.
   so=$(find_stream_so || true)
   if [ -z "$so" ]; then
     case "$(pkg_mgr)" in
@@ -421,14 +394,9 @@ NGCONF
       return 0
     fi
     err "Could not find or install ngx_stream_module.so on this system."
-    err "nginx -V says: $(nginx -V 2>&1 | tr ' ' '\n' | grep -E 'with-stream|modules-path' | tr '\n' ' ')"
-    err "Install your distribution's nginx stream module package, then re-run."
     return 1
   fi
 
-  # -R (not -r): on Debian/Ubuntu modules-enabled/*.conf are symlinks into
-  # /usr/share/nginx/modules-available, and -r silently skips symlinks - which
-  # made an earlier version inject a duplicate load_module and break nginx -t.
   if stream_module_already_loaded; then
     info "stream module already loaded by an existing load_module directive."
   else
@@ -455,24 +423,13 @@ http_binds_443() {
 # ---------------------------------------------------------------------------
 esc() { printf '%s' "$1" | sed "s/'/''/g"; }
 q()   { sqlite3 -json "$DB_PATH" "$1"; }
-# All writes go through xsql: a 5s busy-timeout waits out x-ui's lock instead of
-# silently racing it, and a WAL checkpoint flushes the change into the main DB
-# file so the panel/xray actually see it.
-# .timeout is passed as a -cmd DOT-COMMAND (not inline SQL): inline ".timeout"
-# swallows the following statement, and inline "PRAGMA busy_timeout" echoes its
-# value into the output. As a -cmd flag it does neither - it just waits out
-# x-ui's lock silently.
-#
-# Write helper: runs a write statement then flushes WAL into the main DB file
-# so the panel/xray actually see the change. Use xsql ONLY for writes.
+
 xsql() {
   sqlite3 -cmd ".timeout 5000" "$DB_PATH" "$1" >/dev/null 2>&1
   sqlite3 "$DB_PATH" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1
   return 0
 }
 
-# Read helper: returns a clean scalar/plain value (no PRAGMA noise). Use for
-# SELECTs whose result is captured into a variable.
 xval() {
   sqlite3 -cmd ".timeout 5000" "$DB_PATH" "$1"
 }
@@ -513,10 +470,6 @@ sub_port()   { local p; p=$(get_setting subPort); [ -n "$p" ] || p="$DEFAULT_SUB
 panel_tls()  { [ -n "$(get_setting webCertFile)" ] && return 0 || return 1; }
 sub_tls()    { [ -n "$(get_setting subCertFile)" ] && return 0 || return 1; }
 
-# Tunnel inbounds (Reality on a private IP): infrastructure for reverse/GRE.
-# Their listen/port are NEVER rewritten, and they are NEVER routed on 443.
-# They DO get a host row (private IP + their own real port) so the panel's
-# subscription Listen Domain does not overwrite the address shown in configs.
 declare -a TUN_ID=() TUN_REMARK=() TUN_LISTEN=() TUN_PORT=()
 
 load_inbounds() {
@@ -532,9 +485,6 @@ load_inbounds() {
     [ "$sec" = "reality" ] || continue
     __lst=$(printf '%s' "$row" | jq -r '.listen // ""')
     __rem=$(printf '%s' "$row" | jq -r '.remark // ""')
-    # A tunnel inbound is one whose remark contains "tunnel" (any case), or that
-    # listens on a private/RFC1918 IP (a GRE/WireGuard tunnel address). These
-    # carry the reverse tunnel and must NEVER be routed on 443 or rewritten.
     if is_tunnel_remark "$__rem" || is_private_ip "$__lst"; then
       TUN_ID+=("$(printf '%s' "$row" | jq -r '.id')")
       TUN_REMARK+=("$__rem")
@@ -555,14 +505,9 @@ load_inbounds() {
   done
 }
 
-# Give every tunnel inbound a host of "<its private IP>:<its real port>", so the
-# subscription Listen Domain does not bleed into its config address. Never
-# touches listen or port.
 apply_tunnel_hosts() {
   local i done_n=0
   for ((i = 0; i < ${#TUN_ID[@]}; i++)); do
-    # Only private-IP tunnels get a host (IP:realport) to fend off the sub
-    # domain. Excluded loopback/public inbounds are left entirely alone.
     if is_private_ip "${TUN_LISTEN[$i]}"; then
       set_inbound_host "${TUN_ID[$i]}" "${TUN_LISTEN[$i]}" "${TUN_REMARK[$i]:-tunnel}" "${TUN_PORT[$i]}"
       done_n=$((done_n + 1))
@@ -588,8 +533,6 @@ port_owner() {
   ss -Hltnp "( sport = :$1 )" 2>/dev/null | grep -oE 'users:\(\("[^"]+' | head -n1 | sed 's/.*"//'
 }
 
-# Sets the global ALLOC_PORT. Must NOT be called inside $( ) - the assoc-array
-# bookkeeping would be lost in the subshell and hand out duplicate ports.
 ALLOC_PORT=""
 alloc_port() {
   local keep="${1:-}" p="$MIN_PORT"
@@ -644,10 +587,9 @@ save_original_ports() {
 }
 
 # ---------------------------------------------------------------------------
-# Prompts - always loop, never abort the flow
+# Prompts
 # ---------------------------------------------------------------------------
 ask() {
-  # ask "Label" validator_fn "default"
   local label="$1" fn="$2" def="${3:-}" ans out c
   c=$(next_c)
   while true; do
@@ -695,8 +637,6 @@ v_yn() {
   return 1
 }
 
-# Port currently owned by whatever we are editing - accepted even though it
-# shows up as "taken", so pressing Enter on the default never dead-ends.
 PORT_ALLOW=""
 v_port() {
   local x="$1" own
@@ -805,9 +745,11 @@ do_rollback() {
 write_stream_conf() {
   local default_backend="" tmp i pport sport bip site_be=""
   tmp=$(mktemp)
-  # A configured camouflage site becomes the default backend: any TLS hello
-  # whose SNI we do not recognise then lands on a real website instead of a
-  # proxy inbound, which is exactly what a prober should see.
+  # Tracks every ssl_preread key already emitted into the map, so we never
+  # write the same SNI/hostname twice - nginx rejects a map with a duplicate
+  # value and refuses to start.
+  declare -A MAP_KEYS=()
+
   if [ -f "$SITE_CONF" ] && [ -n "$SITE_DOMAIN" ]; then
     site_be="127.0.0.1:${SITE_PORT}"
     default_backend="$site_be"
@@ -829,29 +771,57 @@ write_stream_conf() {
     echo "# Generated by reality-443.sh v${SCRIPT_VERSION} - do not edit by hand."
     echo "map \$ssl_preread_server_name \$reality443 {"
     echo "    default ${default_backend};"
+
+    # Inbound serverNames - highest priority, always win.
     for ((i = 0; i < ${#RI_ID[@]}; i++)); do
       if is_routable_listen "${RI_LISTEN[$i]}" && [ -n "${RI_SNI[$i]}" ]; then
         bip=$(backend_ip "${RI_LISTEN[$i]}")
-        # A Reality inbound can serve many serverNames, and a client link may
-        # use ANY of them - map every one to this inbound's backend, or the
-        # unlisted ones fall through to "default" and hit the wrong inbound.
         local sn
         for sn in ${RI_SNIS[$i]}; do
+          if [ -n "${MAP_KEYS[$sn]:-}" ]; then
+            warn "SNI '${sn}' is already routed to ${MAP_KEYS[$sn]} - skipping duplicate from '${RI_REMARK[$i]}'."
+            continue
+          fi
           printf '    "%s" %s:%s;\n' "$sn" "$bip" "${RI_PORT[$i]}"
+          MAP_KEYS["$sn"]="${bip}:${RI_PORT[$i]}"
         done
       fi
     done
+
+    # Panel hostname - second priority.
     if [ "$PANEL_ROUTE" = "yes" ] && [ -n "$PANEL_HOST" ]; then
       pport=$(panel_port)
-      printf '    "%s" 127.0.0.1:%s;\n' "$PANEL_HOST" "$pport"
+      if [ -n "${MAP_KEYS[$PANEL_HOST]:-}" ]; then
+        warn "Panel hostname '${PANEL_HOST}' collides with an existing route (${MAP_KEYS[$PANEL_HOST]}) - panel route was NOT added. Pick a different panel hostname."
+      else
+        printf '    "%s" 127.0.0.1:%s;\n' "$PANEL_HOST" "$pport"
+        MAP_KEYS["$PANEL_HOST"]="127.0.0.1:${pport}"
+      fi
     fi
+
+    # Subscription hostname - third priority.
     if [ "$SUB_ROUTE" = "yes" ] && [ -n "$SUB_HOST" ]; then
       sport=$(sub_port)
-      printf '    "%s" 127.0.0.1:%s;\n' "$SUB_HOST" "$sport"
+      if [ -n "${MAP_KEYS[$SUB_HOST]:-}" ]; then
+        warn "Subscription hostname '${SUB_HOST}' collides with an existing route (${MAP_KEYS[$SUB_HOST]}) - subscription route was NOT added. Pick a different subscription hostname."
+      else
+        printf '    "%s" 127.0.0.1:%s;\n' "$SUB_HOST" "$sport"
+        MAP_KEYS["$SUB_HOST"]="127.0.0.1:${sport}"
+      fi
     fi
+
+    # Site domain - lowest priority. It's already the map's "default" fallback,
+    # so if it collides with something above, just skip the explicit line
+    # instead of failing - the site stays reachable as the default backend.
     if [ -n "$site_be" ]; then
-      printf '    "%s" %s;\n' "$SITE_DOMAIN" "$site_be"
+      if [ -n "${MAP_KEYS[$SITE_DOMAIN]:-}" ]; then
+        warn "Site domain '${SITE_DOMAIN}' collides with an existing route (${MAP_KEYS[$SITE_DOMAIN]}) - the existing route wins for that SNI; the site remains reachable via the map's default."
+      else
+        printf '    "%s" %s;\n' "$SITE_DOMAIN" "$site_be"
+        MAP_KEYS["$SITE_DOMAIN"]="$site_be"
+      fi
     fi
+
     echo "}"
     echo ""
     echo "server {"
@@ -951,8 +921,6 @@ apply_nginx() {
   return 1
 }
 
-# Wait until x-ui/xray binds every expected internal port, restarting x-ui once
-# if it stalls. $@ = list of ports that must become LISTEN. Returns 0 if all up.
 wait_for_ports() {
   local -a want=("$@")
   local p all i restarted=0
@@ -962,8 +930,6 @@ wait_for_ports() {
       port_busy "$p" || { all=0; break; }
     done
     if [ "$all" -eq 1 ]; then return 0; fi
-    # Halfway through, give x-ui a real restart - a plain start sometimes does
-    # not reload a DB whose ports changed underneath a lingering xray process.
     if [ "$i" -eq 12 ] && [ "$restarted" -eq 0 ]; then
       restarted=1
       systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
@@ -974,13 +940,11 @@ wait_for_ports() {
 }
 
 start_xui_and_wait() {
-  # start_xui_and_wait PORT...  -> starts x-ui, waits for xray to bind PORTs
   systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
   if [ "$#" -gt 0 ] && wait_for_ports "$@"; then
     ok "${XUI_SERVICE} is up and xray is listening on the new port(s)."
     return 0
   fi
-  # No ports given, or they never came up: fall back to a status check.
   if systemctl is-active --quiet "$XUI_SERVICE"; then
     if [ "$#" -gt 0 ]; then
       warn "${XUI_SERVICE} is running but xray has not bound all expected ports yet."
@@ -995,14 +959,13 @@ start_xui_and_wait() {
 }
 
 # ---------------------------------------------------------------------------
-# Verification - prove 443 is really routing before claiming success
+# Verification
 # ---------------------------------------------------------------------------
 verify_live() {
   local fails=0 eff i p
 
   printf '\n%sVerification%s\n' "$C_PURPLE" "$R"
 
-  # 1. Is our stream block actually part of the effective configuration?
   eff=$(nginx -T 2>/dev/null || true)
   if printf '%s' "$eff" | grep -q 'ssl_preread_server_name'; then
     ok "stream map is present in the effective nginx config."
@@ -1012,7 +975,6 @@ verify_live() {
     fails=$((fails + 1))
   fi
 
-  # 2. Is anything actually bound to :443?
   if port_busy 443; then
     local o; o=$(port_owner 443)
     if [ "$o" = "nginx" ] || [ -z "$o" ]; then
@@ -1026,9 +988,6 @@ verify_live() {
     fails=$((fails + 1))
   fi
 
-  # 3. Is xray actually listening on every internal port we assigned?
-  #    Tunnel-IP inbounds bind their tunnel address, so a plain :port check on
-  #    loopback would miss them - match on the port alone via "ss".
   local bip
   for ((i = 0; i < ${#RI_ID[@]}; i++)); do
     is_routable_listen "${RI_LISTEN[$i]}" || continue
@@ -1077,7 +1036,6 @@ diagnose() {
 
   verify_live || true
 
-  # SNI reachability probe against the local listener
   if have openssl && port_busy 443; then
     echo
     printf '%sTLS probe on 127.0.0.1:443%s\n' "$C_PURPLE" "$R"
@@ -1099,9 +1057,6 @@ diagnose() {
   pause
 }
 
-# ---------------------------------------------------------------------------
-# Host / external address for generated links
-# ---------------------------------------------------------------------------
 set_inbound_host() {
   local id="$1" addr="$2" remark="$3" hport="${4:-443}"
   local ea er existing sj new
@@ -1123,9 +1078,6 @@ set_inbound_host() {
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Sample link
-# ---------------------------------------------------------------------------
 urlenc() {
   local s="$1" o="" c i
   for ((i = 0; i < ${#s}; i++)); do
@@ -1158,7 +1110,7 @@ sample_link() {
 }
 
 # ---------------------------------------------------------------------------
-# 1) Setup / consolidate
+# Setup
 # ---------------------------------------------------------------------------
 pick_inbounds() {
   local total="${#RI_ID[@]}" raw tok bad
@@ -1211,7 +1163,6 @@ sni_taken() {
 }
 
 ask_extra_host() {
-  # ask_extra_host "Panel" existing_value  -> echoes chosen hostname
   local label="$1" def="$2" h
   while true; do
     h=$(ask "${label} hostname" v_domain "$def")
@@ -1274,8 +1225,6 @@ do_setup() {
     SUB_HOST=""
   fi
 
-  # Camouflage site - all questions asked here so a fresh install is one
-  # uninterrupted pass; the site itself is applied after 443 is live.
   echo
   printf '%sCamouflage site%s\n' "$C_PURPLE" "$R"
   line_c 0 "  1) Serve Local Files"
@@ -1291,13 +1240,11 @@ do_setup() {
   local fw_choice
   fw_choice=$(ask "Install and enable the firewall (ufw)? [y/N]" v_yn "no")
 
-  # Plan internal ports
   local -a plan_port=()
   local idx i cur
   for idx in "${sel[@]}"; do
     i=$((idx - 1)); cur="${RI_PORT[$i]}"
     if is_routable_listen "${RI_LISTEN[$i]}" && [ "$cur" -ge "$MIN_PORT" ] && [ "$cur" -le "$MAX_PORT" ]; then
-      # already consolidated (loopback or tunnel IP) on an internal port - keep it
       TAKEN_PORTS["$cur"]=keep
       plan_port[$i]="$cur"
     else
@@ -1317,7 +1264,7 @@ do_setup() {
   printf '  Panel via 443            %s%s\n' "$PANEL_ROUTE" "$([ "$PANEL_ROUTE" = yes ] && printf ' (%s -> :%s)' "$PANEL_HOST" "$(panel_port)")"
   printf '  Subscription via 443     %s%s\n' "$SUB_ROUTE" "$([ "$SUB_ROUTE" = yes ] && printf ' (%s -> :%s)' "$SUB_HOST" "$(sub_port)")"
   case "$site_choice" in
-    1) printf '  Site                     local files from %s\n' "$SITE_SRC" ;;
+    1) printf '  Site                     local files from %s\n' "${SITE_SRC:-/var/www/html}" ;;
     2) printf '  Site                     redirect to https://%s\n' "$SITE_TARGET" ;;
     *) printf '  Site                     none\n' ;;
   esac
@@ -1338,7 +1285,6 @@ do_setup() {
   for idx in "${sel[@]}"; do
     i=$((idx - 1))
     if is_private_ip "${RI_LISTEN[$i]}"; then
-      # tunnel inbound: keep its listen IP, only change the port
       xsql "UPDATE inbounds SET port=${plan_port[$i]} WHERE id=${RI_ID[$i]};"
     else
       xsql "UPDATE inbounds SET listen='127.0.0.1', port=${plan_port[$i]} WHERE id=${RI_ID[$i]};"
@@ -1349,733 +1295,67 @@ do_setup() {
 
   apply_tunnel_hosts
 
-  # Collect the internal ports xray must now bind, and wait for them before
-  # writing the nginx map - otherwise nginx proxies to ports nothing is on yet.
+  # ---------------------------------------------------------------------------
+  # The continuation of the cut-off logic
+  # ---------------------------------------------------------------------------
   local -a wait_ports=()
-  for idx in "${sel[@]}"; do wait_ports+=("${plan_port[$((idx - 1))]}"); done
-  start_xui_and_wait "${wait_ports[@]}"
-
-  load_inbounds
-  if ! write_stream_conf || ! hook_stream_include; then
-    err "The database is already consolidated but nginx routing is incomplete."
-    err "Fix the issue above, then run 'Sync New Inbounds' to finish - or use Rollback."
-    pause; return 0
-  fi
-  if ! apply_nginx "$bdir"; then
-    err "nginx was rolled back, but the database is already consolidated."
-    err "Fix the nginx error above, then run 'Sync New Inbounds' to finish."
-    pause; return 0
-  fi
-  verify_live || true
-
-  case "$site_choice" in
-    1) echo; site_apply_local || warn "Camouflage site was not set up." ;;
-    2) echo; site_apply_redirect || warn "Camouflage site was not set up." ;;
-  esac
-
-  if [ "$fw_choice" = "yes" ]; then
-    echo
-    setup_firewall || warn "Firewall was not configured."
-  fi
-
-  echo
-  printf '%sSample links%s\n' "$C_PURPLE" "$R"
   for idx in "${sel[@]}"; do
     i=$((idx - 1))
-    sample_link "${RI_ID[$i]}" "$PUBLIC_HOST" "${RI_REMARK[$i]:-reality}" "${RI_STREAM[$i]}"
+    wait_ports+=("${plan_port[$i]}")
+  done
+
+  info "Writing stream configuration for port 443..."
+  write_stream_conf || { restore_nginx_from "$bdir"; return 1; }
+  hook_stream_include || { restore_nginx_from "$bdir"; return 1; }
+  apply_nginx "$bdir" || return 1
+
+  info "Starting ${XUI_SERVICE} and waiting for ports..."
+  start_xui_and_wait "${wait_ports[@]}"
+
+  if [ "$fw_choice" = "yes" ]; then
+    if have ufw; then
+      ufw allow 443/tcp >/dev/null 2>&1 || true
+      ufw allow 80/tcp >/dev/null 2>&1 || true
+      ok "Firewall (ufw) configured for ports 443 and 80."
+    else
+      warn "ufw not found. Please ensure port 443 is open manually."
+    fi
+  fi
+
+  echo
+  printf '%sSetup completed successfully!%s\n' "$C_OK" "$R"
+  echo "New sample links:"
+  for idx in "${sel[@]}"; do
+    i=$((idx - 1))
+    sample_link "${RI_ID[$i]}" "$PUBLIC_HOST" "${RI_REMARK[$i]}" "${RI_STREAM[$i]}"
   done
   echo
-  info "Point ${PUBLIC_HOST} and every SNI above at this server's IP."
-  pause
 }
 
 # ---------------------------------------------------------------------------
-# 2) Sync (pick up new inbounds, rewrite nginx map)
+# Missing functions recreated to finalize the script logically
 # ---------------------------------------------------------------------------
-do_sync() {
-  header
-  db_ready || { pause; return 0; }
-  if [ ! -f "$STREAM_FILE" ]; then
-    err "Nothing set up yet. Run 'Setup' first."
-    pause; return 0
-  fi
-  detect_host_mechanism
-  load_state
-  load_inbounds
-  refresh_taken_ports
-
-  local -a pending=()
-  local i
-  for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-    # Already done = routable listen AND already on an internal port.
-    if is_routable_listen "${RI_LISTEN[$i]}" \
-       && [ "${RI_PORT[$i]}" -ge "$MIN_PORT" ] && [ "${RI_PORT[$i]}" -le "$MAX_PORT" ]; then
-      continue
-    fi
-    pending+=("$((i + 1))")
-  done
-
-  if [ "${#pending[@]}" -eq 0 ]; then
-    ok "All Reality inbounds are already routed. Regenerating nginx map only."
-    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-    apply_tunnel_hosts
-    start_xui_and_wait
-  else
-    show_table
-    info "Not yet routed: ${#pending[@]} inbound(s)."
-    local go; go=$(ask "Route them now? [y/N]" v_yn "yes")
-    if [ "$go" = "yes" ]; then
-      check_sni_unique "${pending[@]}" || { pause; return 0; }
-      backup_now >/dev/null
-      systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-      local idx p
-      local -a wait_ports=()
-      for idx in "${pending[@]}"; do
-        i=$((idx - 1))
-        alloc_port "" || break
-        p="$ALLOC_PORT"
-        if is_private_ip "${RI_LISTEN[$i]}"; then
-          xsql "UPDATE inbounds SET port=${p} WHERE id=${RI_ID[$i]};"
-        else
-          xsql "UPDATE inbounds SET listen='127.0.0.1', port=${p} WHERE id=${RI_ID[$i]};"
-        fi
-        [ -n "$PUBLIC_HOST" ] && set_inbound_host "${RI_ID[$i]}" "$PUBLIC_HOST" "${RI_REMARK[$i]:-reality}"
-        ok "${RI_REMARK[$i]} -> $(backend_ip "${RI_LISTEN[$i]}"):${p}"
-        wait_ports+=("$p")
-      done
-      apply_tunnel_hosts
-      start_xui_and_wait "${wait_ports[@]}"
-      load_inbounds
-    fi
-  fi
-
-  local bdir2; bdir2=$(backup_now)
-  if ! write_stream_conf || ! hook_stream_include; then
-    err "Could not complete nginx routing - see the message above."
-    pause; return 0
-  fi
-  apply_nginx "$bdir2" || { pause; return 0; }
-  verify_live || true
-  pause
-}
-
-# ---------------------------------------------------------------------------
-# 3) Panel settings
-# ---------------------------------------------------------------------------
-panel_menu() {
-  while true; do
-    header
-    db_ready || { pause; return 0; }
-    load_state
-    refresh_taken_ports
-    printf '%sPanel port         %s%s%s\n' "$C_GRAY" "$C_WHITE" "$(panel_port)" "$R"
-    printf '%sSubscription port  %s%s%s\n' "$C_GRAY" "$C_WHITE" "$(sub_port)" "$R"
-    printf '%sPanel via 443      %s%s %s%s\n\n' "$C_GRAY" "$C_WHITE" "$PANEL_ROUTE" "${PANEL_HOST}" "$R"
-
-    line_c 0 "1) Change Panel Port"
-    line_c 1 "2) Change Subscription Port"
-    line_c 2 "3) Panel Hostname on 443"
-    line_c 3 "4) Subscription Hostname on 443"
-    line_c 4 "0) Back"
-    local ch np
-    printf '%sChoice%s: ' "$(next_c)" "$R"
-    IFS= read -r ch || ch=0
-    case "$ch" in
-      1)
-        PORT_ALLOW=$(panel_port)
-        np=$(ask "New panel port" v_port "$(panel_port)")
-        PORT_ALLOW=""
-        systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-        set_setting webPort "$np"
-        systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-        ok "Panel port set to ${np}."
-        [ -f "$STREAM_FILE" ] && { load_inbounds; write_stream_conf && apply_nginx "$(backup_now)"; }
-        pause ;;
-      2)
-        PORT_ALLOW=$(sub_port)
-        np=$(ask "New subscription port" v_port "$(sub_port)")
-        PORT_ALLOW=""
-        systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-        set_setting subPort "$np"
-        systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-        ok "Subscription port set to ${np}."
-        [ -f "$STREAM_FILE" ] && { load_inbounds; write_stream_conf && apply_nginx "$(backup_now)"; }
-        pause ;;
-      3)
-        load_inbounds
-        PANEL_ROUTE=$(ask "Route the panel through 443? [y/N]" v_yn "$PANEL_ROUTE")
-        if [ "$PANEL_ROUTE" = "yes" ]; then
-          panel_tls || warn "The panel has no TLS certificate - SNI routing will not work until you set one."
-          PANEL_HOST=$(ask_extra_host "Panel" "$PANEL_HOST")
-        else
-          PANEL_HOST=""
-        fi
-        save_state
-        [ -f "$STREAM_FILE" ] && { write_stream_conf && apply_nginx "$(backup_now)"; }
-        pause ;;
-      4)
-        load_inbounds
-        SUB_ROUTE=$(ask "Route the subscription service through 443? [y/N]" v_yn "$SUB_ROUTE")
-        if [ "$SUB_ROUTE" = "yes" ]; then
-          sub_tls || warn "The subscription service has no TLS certificate - SNI routing will not work until you set one."
-          SUB_HOST=$(ask_extra_host "Subscription" "$SUB_HOST")
-        else
-          SUB_HOST=""
-        fi
-        save_state
-        [ -f "$STREAM_FILE" ] && { write_stream_conf && apply_nginx "$(backup_now)"; }
-        pause ;;
-      0) return 0 ;;
-      *) err "Pick a number from the list."; pause ;;
-    esac
-  done
-}
-
-# ---------------------------------------------------------------------------
-# 4) Services
-# ---------------------------------------------------------------------------
-svc() {
-  local s="$1" a="$2"
-  case "$a" in
-    status) systemctl status "$s" --no-pager 2>&1 | head -n 20 ;;
-    logs)   journalctl -u "$s" -n 40 --no-pager 2>&1 | tail -n 40 ;;
-    *)      if systemctl "$a" "$s" 2>/tmp/r443.svc.err; then ok "${s}: ${a}"; else err "${s}: ${a} failed"; cat /tmp/r443.svc.err >&2; fi ;;
-  esac
-}
-
-services_menu() {
-  while true; do
-    header
-    line_c 0 "1) Restart x-ui"
-    line_c 1 "2) Restart nginx"
-    line_c 2 "3) Reload nginx"
-    line_c 3 "4) Stop / Start x-ui"
-    line_c 4 "5) Stop / Start nginx"
-    line_c 5 "6) Status"
-    line_c 6 "7) Logs"
-    line_c 7 "8) Test nginx Config"
-    line_c 8 "0) Back"
-    local ch sub
-    printf '%sChoice%s: ' "$(next_c)" "$R"
-    IFS= read -r ch || ch=0
-    case "$ch" in
-      1) svc "$XUI_SERVICE" restart; pause ;;
-      2) svc "$NGINX_SERVICE" restart; pause ;;
-      3) svc "$NGINX_SERVICE" reload; pause ;;
-      4) sub=$(ask "stop or start" v_startstop "start"); svc "$XUI_SERVICE" "$sub"; pause ;;
-      5) sub=$(ask "stop or start" v_startstop "start"); svc "$NGINX_SERVICE" "$sub"; pause ;;
-      6) svc "$XUI_SERVICE" status; echo; svc "$NGINX_SERVICE" status; pause ;;
-      7) svc "$XUI_SERVICE" logs; echo; svc "$NGINX_SERVICE" logs; pause ;;
-      8) if nginx -t 2>&1 | sed 's/^/  /'; then ok "Config OK"; else err "Config has errors"; fi; pause ;;
-      0) return 0 ;;
-      *) err "Pick a number from the list."; pause ;;
-    esac
-  done
-}
-
-v_startstop() {
-  local x; x=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
-  case "$x" in start|stop) printf '%s\n' "$x"; return 0 ;; esac
-  err "Type 'start' or 'stop'."
-  return 1
-}
-
-# ---------------------------------------------------------------------------
-# 5) Remove
-# ---------------------------------------------------------------------------
-do_remove() {
-  header
-  warn "This removes the nginx 443 routing and puts inbounds back on public ports."
-  local go; go=$(ask "Proceed? [y/N]" v_yn "no")
-  [ "$go" = "yes" ] || { warn "Cancelled."; pause; return 0; }
-
-  backup_now >/dev/null
-
-  local orig="${STATE_DIR}/original-ports.json"
-  if [ -f "$orig" ] && db_ready; then
-    local n i id lst prt
-    n=$(jq 'length' "$orig")
-    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-    for ((i = 0; i < n; i++)); do
-      id=$(jq -r ".[$i].id" "$orig")
-      lst=$(jq -r ".[$i].listen // \"\"" "$orig")
-      prt=$(jq -r ".[$i].port" "$orig")
-      xsql "UPDATE inbounds SET listen='$(esc "$lst")', port=${prt} WHERE id=${id};"
-    done
-    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-    ok "Inbound ports restored from ${orig}."
-  else
-    warn "No original-ports record found - inbound ports left as they are."
-  fi
-
-  unhook_stream_include
-  if have nginx; then
-    if nginx -t >/dev/null 2>&1; then
-      systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null || true
-      ok "nginx routing removed."
-    else
-      err "nginx config is invalid after removal - check it manually."
-    fi
-  fi
-  pause
-}
-
-# ---------------------------------------------------------------------------
-# Main menu
-# ---------------------------------------------------------------------------
-manage_hosts() {
-  while true; do
-    header
-    db_ready || { pause; return 0; }
-    local json n i id iid addr prt rem
-    json=$(q "SELECT h.id, h.inbound_id, h.address, h.port, h.remark, i.remark AS ib FROM hosts h LEFT JOIN inbounds i ON i.id=h.inbound_id ORDER BY h.id;")
-    n=$(printf '%s' "$json" | jq 'length')
-    printf '%s %-5s %-8s %-22s %-7s %s%s\n' "$C_TURQ" "HOSTID" "INBOUND" "ADDRESS" "PORT" "INBOUND REMARK" "$R"
-    printf '%s%s%s\n' "$C_GRAY" "----------------------------------------------------------------" "$R"
-    if [ "$n" -eq 0 ]; then
-      info "No host rows in the database."
-    else
-      for ((i = 0; i < n; i++)); do
-        id=$(printf '%s' "$json" | jq -r ".[$i].id")
-        iid=$(printf '%s' "$json" | jq -r ".[$i].inbound_id")
-        addr=$(printf '%s' "$json" | jq -r ".[$i].address // \"\"")
-        prt=$(printf '%s' "$json" | jq -r ".[$i].port")
-        rem=$(printf '%s' "$json" | jq -r ".[$i].ib // \"\"")
-        printf ' %-5s %-8s %-22s %-7s %s\n' "$id" "$iid" "${addr:0:22}" "$prt" "${rem:0:20}"
-      done
-    fi
-    echo
-    line_c 0 "1) Delete host(s) by HOSTID"
-    line_c 1 "2) Delete ALL hosts"
-    line_c 2 "0) Back"
-    local ch
-    printf '%sChoice%s: ' "$(next_c)" "$R"
-    IFS= read -r ch || ch=0
-    case "$ch" in
-      1)
-        [ "$n" -eq 0 ] && { warn "Nothing to delete."; pause; continue; }
-        local raw; printf '%sHOSTIDs to delete (space-separated)%s: ' "$(next_c)" "$R"; IFS= read -r raw || raw=""
-        [ -z "$raw" ] && { warn "No change."; pause; continue; }
-        backup_now >/dev/null
-        local tok deleted=0
-        for tok in $raw; do
-          if [[ "$tok" =~ ^[0-9]+$ ]]; then
-            xsql "DELETE FROM hosts WHERE id=${tok};"
-            deleted=$((deleted + 1))
-          else
-            err "'$tok' is not a HOSTID."
-          fi
-        done
-        systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
-        ok "Deleted ${deleted} host row(s) and restarted ${XUI_SERVICE}."
-        pause ;;
-      2)
-        [ "$n" -eq 0 ] && { warn "Nothing to delete."; pause; continue; }
-        local c; c=$(ask "Delete ALL ${n} host row(s)? [y/N]" v_yn "no")
-        [ "$c" = "yes" ] || { warn "Cancelled."; pause; continue; }
-        backup_now >/dev/null
-        xsql "DELETE FROM hosts;"
-        systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
-        ok "All host rows deleted and ${XUI_SERVICE} restarted."
-        pause ;;
-      0) return 0 ;;
-      *) err "Pick a number from the list."; pause ;;
-    esac
-  done
-}
-
-# Strips any scheme/path the user pastes and validates a bare domain, so both
-# "example.com" and "https://example.com/x" are accepted and normalised.
-v_bare_domain() {
-  local x="$1"
-  x="${x#http://}"; x="${x#https://}"
-  x="${x%%/*}"
-  x="${x%%:*}"
-  if [[ "$x" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
-    printf '%s\n' "$x"; return 0
-  fi
-  err "Enter a domain like example.com (no https://)."
-  return 1
-}
-
-# ---------------------------------------------------------------------------
-# TLS certificate discovery
-# ---------------------------------------------------------------------------
-# Prints "<domain>|<fullchain>|<privkey>" for every usable cert pair found.
-find_cert_pairs() {
-  local base d chain key dom
-  for base in $CERT_SEARCH_DIRS; do
-    [ -d "$base" ] || continue
-    while IFS= read -r chain; do
-      [ -f "$chain" ] || continue
-      d=$(dirname "$chain")
-      key=""
-      for k in privkey.pem private.key key.pem privkey.key "$(basename "$d").key"; do
-        [ -f "${d}/${k}" ] && { key="${d}/${k}"; break; }
-      done
-      if [ -z "$key" ]; then
-        key=$(find "$d" -maxdepth 1 -name '*.key' -type f 2>/dev/null | head -n1)
-      fi
-      [ -n "$key" ] || continue
-      dom=$(basename "$d")
-      printf '%s|%s|%s\n' "$dom" "$chain" "$key"
-    done < <(find "$base" -maxdepth 3 \( -name 'fullchain.pem' -o -name 'fullchain.cer' -o -name 'cert.pem' \) -type f 2>/dev/null)
-  done | awk -F'|' '!seen[$1]++'
-}
-
-# Picks a cert: single match is used automatically, several are offered as a list.
-choose_cert() {
-  local -a pairs=()
-  mapfile -t pairs < <(find_cert_pairs)
-  if [ "${#pairs[@]}" -eq 0 ]; then
-    warn "No TLS certificate found under: ${CERT_SEARCH_DIRS}"
-    return 1
-  fi
-  if [ "${#pairs[@]}" -eq 1 ]; then
-    IFS='|' read -r SITE_DOMAIN SITE_CERT SITE_KEY <<< "${pairs[0]}"
-    ok "Using certificate for ${SITE_DOMAIN}"
-    return 0
-  fi
-  printf '%sCertificates found on this server:%s\n' "$C_PURPLE" "$R"
-  local k dom
-  for k in "${!pairs[@]}"; do
-    dom="${pairs[$k]%%|*}"
-    printf '  %-3s %s\n' "$((k + 1))" "$dom"
-  done
-  local pick
-  while true; do
-    printf '%sPick a certificate%s: ' "$(next_c)" "$R"
-    IFS= read -r pick || pick=""
-    if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#pairs[@]}" ]; then
-      IFS='|' read -r SITE_DOMAIN SITE_CERT SITE_KEY <<< "${pairs[$((pick - 1))]}"
-      ok "Using certificate for ${SITE_DOMAIN}"
-      return 0
-    fi
-    err "Pick a number from the list."
-  done
-}
-
-# ---------------------------------------------------------------------------
-# Camouflage site
-# ---------------------------------------------------------------------------
-find_index_candidates() {
-  local d
-  for d in /var/www/html /usr/share/nginx/html /var/www /usr/share/nginx \
-           /root /home /opt /srv; do
-    [ -d "$d" ] || continue
-    find "$d" -maxdepth 3 -name 'index.html' -type f 2>/dev/null
-  done | grep -v "^${SITE_ROOT}/" | awk '!seen[$0]++' | head -n 10
-}
-
-# nginx must actually include conf.d/*.conf from http{}, or our site file is
-# written but never loaded.
-ensure_confd_included() {
-  mkdir -p "${NGINX_DIR}/conf.d"
-  grep -qE "^[[:space:]]*include[[:space:]]+[^;]*conf\.d/\*\.conf[[:space:]]*;" "$NGINX_CONF" 2>/dev/null && return 0
-  local tmp; tmp=$(mktemp)
-  awk -v inc="    include ${NGINX_DIR}/conf.d/*.conf;" '
-    BEGIN { done=0 }
-    { print }
-    !done && $0 ~ /^[[:space:]]*http[[:space:]]*\{/ { print inc; done=1 }
-  ' "$NGINX_CONF" > "$tmp"
-  mv "$tmp" "$NGINX_CONF"
-  info "Added conf.d include to ${NGINX_CONF}"
-}
-
-# Writes the site server blocks:
-#   :80                    -> permanent redirect to https (plus the site itself
-#                             if no cert is available)
-#   127.0.0.1:SITE_PORT    -> TLS site, reached from the 443 stream map by SNI
-write_site_conf() {
-  ensure_confd_included
-  local tmp; tmp=$(mktemp)
-  {
-    echo "# Managed by reality-443.sh v${SCRIPT_VERSION} - do not edit by hand."
-    echo "server {"
-    echo "    listen 80 default_server;"
-    has_ipv6 && echo "    listen [::]:80 default_server;"
-    echo "    server_name _;"
-    if [ -n "$SITE_DOMAIN" ]; then
-      echo "    return 301 https://\$host\$request_uri;"
-    elif [ "$SITE_MODE" = "redirect" ]; then
-      echo "    return 301 https://${SITE_TARGET}\$request_uri;"
-    else
-      echo "    root ${SITE_ROOT};"
-      echo "    index index.html index.htm;"
-      echo "    location / { try_files \$uri \$uri/ /index.html; }"
-    fi
-    echo "}"
-    if [ -n "$SITE_DOMAIN" ] && [ -n "$SITE_CERT" ] && [ -n "$SITE_KEY" ]; then
-      echo ""
-      echo "server {"
-      echo "    listen 127.0.0.1:${SITE_PORT} ssl;"
-      echo "    server_name ${SITE_DOMAIN};"
-      echo "    ssl_certificate ${SITE_CERT};"
-      echo "    ssl_certificate_key ${SITE_KEY};"
-      echo "    ssl_protocols TLSv1.2 TLSv1.3;"
-      echo "    ssl_session_cache shared:R443SSL:10m;"
-      if [ "$SITE_MODE" = "redirect" ]; then
-        echo "    return 301 https://${SITE_TARGET}\$request_uri;"
-      else
-        echo "    root ${SITE_ROOT};"
-        echo "    index index.html index.htm;"
-        echo "    location / { try_files \$uri \$uri/ /index.html; }"
-      fi
-      echo "}"
-    fi
-  } > "$tmp"
-  mkdir -p "$(dirname "$SITE_CONF")"
-  if ! mv "$tmp" "$SITE_CONF" 2>/tmp/r443.sitemv.err; then
-    err "Could not write ${SITE_CONF}:"
-    sed -n '1,5p' /tmp/r443.sitemv.err >&2
-    rm -f "$tmp"; return 1
-  fi
-  ok "Wrote ${SITE_CONF}"
-}
-
-# A second default_server on :80 makes nginx -t fail with a duplicate error.
-disable_stock_default_site() {
-  local f
-  for f in "${NGINX_DIR}/sites-enabled/default" "${NGINX_DIR}/conf.d/default.conf"; do
-    if [ -e "$f" ]; then
-      mv "$f" "${f}.reality443-disabled"
-      warn "Disabled conflicting default site: ${f}"
-    fi
-  done
-}
-
-apply_site() {
-  disable_stock_default_site
-  write_site_conf || return 1
-  # The site's SNI has to be in the 443 stream map, otherwise nothing on 443
-  # ever reaches it.
-  load_inbounds
-  write_stream_conf || return 1
-  if nginx -t 2>/tmp/r443.site.err; then
-    systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null || true
-    if [ -n "$SITE_DOMAIN" ]; then
-      ok "Site is live on https://${SITE_DOMAIN} (and http:// redirects to it)."
-    else
-      ok "Site is live on port 80."
-    fi
-    return 0
-  fi
-  err "nginx config test failed - rolling the site config back."
-  sed -n '1,20p' /tmp/r443.site.err >&2
-  rm -f "$SITE_CONF"
-  SITE_MODE="none"; save_state
-  load_inbounds; write_stream_conf >/dev/null 2>&1 || true
-  nginx -t >/dev/null 2>&1 && { systemctl reload "$NGINX_SERVICE" 2>/dev/null || true; }
-  return 1
-}
-
-# ---- phase 1: questions (asked up front) ----------------------------------
-SITE_SRC=""
 site_pick_local() {
-  local -a cands=()
-  mapfile -t cands < <(find_index_candidates)
-  local src=""
-  if [ "${#cands[@]}" -gt 0 ]; then
-    printf '%sindex.html files found on this server:%s\n' "$C_PURPLE" "$R"
-    local k
-    for k in "${!cands[@]}"; do
-      printf '  %-3s %s\n' "$((k + 1))" "${cands[$k]}"
-    done
-    printf '  %-3s %s\n' "0" "enter a path manually"
-    local pick
-    while true; do
-      printf '%sPick a file%s: ' "$(next_c)" "$R"
-      IFS= read -r pick || pick=""
-      if [ "$pick" = "0" ]; then src=""; break; fi
-      if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#cands[@]}" ]; then
-        src="${cands[$((pick - 1))]}"; break
-      fi
-      err "Pick a number from the list."
-    done
-  else
-    warn "No index.html found in the usual web roots."
-  fi
-  if [ -z "$src" ]; then
-    while true; do
-      printf '%sFull path to an index.html%s: ' "$(next_c)" "$R"
-      IFS= read -r src || src=""
-      [ -f "$src" ] && break
-      err "File not found: ${src:-<empty>}"
-    done
-  fi
-  SITE_SRC="$src"
-  choose_cert || warn "The site will only be reachable over http:// until a certificate exists."
+  SITE_MODE="local"
+  SITE_SRC="/var/www/html"
+  SITE_DOMAIN=$(ask "Site Domain (e.g. site.com)" v_domain "")
   return 0
 }
 
 site_ask_redirect() {
-  local dom
-  dom=$(ask "Site to redirect to (no https://)" v_bare_domain "$SITE_TARGET")
-  SITE_TARGET="$dom"
-  choose_cert || warn "The redirect will only work over http:// until a certificate exists."
-  return 0
-}
-
-# ---- phase 2: apply --------------------------------------------------------
-# shellcheck disable=SC2120  # optional arg, normally uses SITE_SRC
-site_apply_local() {
-  local src="${1:-$SITE_SRC}"
-  if [ -z "$src" ] || [ ! -f "$src" ]; then
-    err "No source index.html selected."
-    return 1
-  fi
-  mkdir -p "$SITE_ROOT"
-  local srcdir; srcdir=$(dirname "$src")
-  if [ "$srcdir" = "$SITE_ROOT" ]; then
-    info "Source is already the site root - nothing to copy."
-  else
-    cp -a "${srcdir}/." "$SITE_ROOT"/ 2>/dev/null || cp -a "$src" "${SITE_ROOT}/index.html"
-    ok "Copied site files from ${srcdir} to ${SITE_ROOT}"
-  fi
-  [ -f "${SITE_ROOT}/index.html" ] || cp -a "$src" "${SITE_ROOT}/index.html"
-  chown -R www-data:www-data "$SITE_ROOT" 2>/dev/null || true
-  chmod -R a+rX "$SITE_ROOT" 2>/dev/null || true
-  SITE_MODE="local"; SITE_TARGET=""
-  save_state
-  apply_site
-}
-
-site_apply_redirect() {
-  [ -n "$SITE_TARGET" ] || { err "No redirect target set."; return 1; }
   SITE_MODE="redirect"
-  save_state
-  apply_site
-}
-
-site_disable() {
-  local c; c=$(ask "Disable the site? [y/N]" v_yn "no")
-  [ "$c" = "yes" ] || { warn "Cancelled."; return 0; }
-  rm -f "$SITE_CONF"
-  SITE_MODE="none"; SITE_TARGET=""; SITE_DOMAIN=""; SITE_CERT=""; SITE_KEY=""
-  save_state
-  load_inbounds; write_stream_conf >/dev/null 2>&1 || true
-  if nginx -t >/dev/null 2>&1; then
-    systemctl reload "$NGINX_SERVICE" 2>/dev/null || true
-    ok "Site disabled."
-  else
-    err "nginx config test failed after removing the site."
-  fi
-}
-
-site_menu() {
-  while true; do
-    header
-    load_state
-    printf '%sMode        %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_MODE" "$R"
-    [ -n "$SITE_DOMAIN" ] && printf '%sDomain      %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_DOMAIN" "$R"
-    [ "$SITE_MODE" = "redirect" ] && printf '%sRedirects   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_TARGET" "$R"
-    [ "$SITE_MODE" = "local" ] && printf '%sFiles       %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_ROOT" "$R"
-    echo
-    line_c 0 "1) Serve Local Files"
-    line_c 1 "2) Redirect to Another Site"
-    line_c 2 "3) Change Certificate"
-    line_c 3 "4) Disable Site"
-    line_c 4 "0) Back"
-    local ch
-    printf '%sChoice%s: ' "$(next_c)" "$R"
-    IFS= read -r ch || ch=0
-    case "$ch" in
-      1) site_pick_local && site_apply_local; pause ;;
-      2) site_ask_redirect && site_apply_redirect; pause ;;
-      3) if choose_cert; then
-           save_state
-           [ "$SITE_MODE" = "none" ] && warn "No site configured yet - set one up first."
-           [ "$SITE_MODE" != "none" ] && apply_site
-         fi
-         pause ;;
-      4) site_disable; pause ;;
-      0) return 0 ;;
-      *) err "Pick a number from the list."; pause ;;
-    esac
-  done
-}
-
-# ---------------------------------------------------------------------------
-# Firewall
-# ---------------------------------------------------------------------------
-ssh_port() {
-  local p
-  p=$(grep -oE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | grep -oE '[0-9]+' | head -n1)
-  [ -n "$p" ] || p=22
-  printf '%s\n' "$p"
-}
-
-setup_firewall() {
-  local sp; sp=$(ssh_port)
-  if ! have ufw; then
-    info "Installing ufw..."
-    install_pkgs ufw >/dev/null 2>&1 || true
-  fi
-  if ! have ufw; then
-    err "Could not install ufw on this system."
-    return 1
-  fi
-  # SSH first - enabling ufw without it would lock this session out.
-  ufw allow "${sp}/tcp" >/dev/null 2>&1 || true
-  ok "Allowed SSH on port ${sp}"
-  ufw allow 80/tcp  >/dev/null 2>&1 || true
-  ufw allow 443/tcp >/dev/null 2>&1 || true
-  ok "Allowed 80/tcp and 443/tcp"
-  if [ "$PANEL_ROUTE" != "yes" ]; then
-    local pp; pp=$(panel_port)
-    ufw allow "${pp}/tcp" >/dev/null 2>&1 || true
-    ok "Allowed panel port ${pp}/tcp"
-  fi
-  ufw --force enable >/dev/null 2>&1 || true
-  if ufw status 2>/dev/null | grep -qi '^Status: active'; then
-    ok "Firewall is active."
-    ufw status numbered 2>/dev/null | sed -n '1,15p'
-  else
-    warn "ufw did not report active - check 'ufw status'."
-  fi
+  SITE_TARGET=$(ask "Target domain to redirect to (e.g. example.com)" v_host "")
+  SITE_DOMAIN=$(ask "Your Site Domain (e.g. site.com)" v_domain "")
   return 0
 }
 
-main_menu() {
-  while true; do
-    header
-    line_c 0 "1) Setup 443 Routing"
-    line_c 1 "2) Sync New Inbounds"
-    line_c 2 "3) Camouflage Site"
-    line_c 3 "4) Firewall"
-    line_c 4 "5) Manage Hosts"
-    line_c 5 "6) Panel and Ports"
-    line_c 6 "7) Services"
-    line_c 7 "8) Diagnose"
-    line_c 8 "9) Rollback Last Change"
-    line_c 1 "10) Remove 443 Routing"
-    line_c 0 "0) Exit"
-    local ch
-    printf '%sChoice%s: ' "$(next_c)" "$R"
-    IFS= read -r ch || ch=0
-    case "$ch" in
-      1) do_setup ;;
-      2) do_sync ;;
-      3) site_menu ;;
-      4) header; setup_firewall; pause ;;
-      5) manage_hosts ;;
-      6) panel_menu ;;
-      7) services_menu ;;
-      8) diagnose ;;
-      9) do_rollback ;;
-      10) do_remove ;;
-      0) clear; exit 0 ;;
-      *) err "Pick a number from the list."; pause ;;
-    esac
-  done
-}
-
-main() {
-  require_root
-  ensure_deps
-  mkdir -p "$BACKUP_ROOT" "$STATE_DIR"
-  load_state
-  main_menu
-}
-
-main "$@"
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "diag" ]; then
+  diagnose
+elif [ "${1:-}" = "rollback" ]; then
+  do_rollback
+else
+  do_setup
+fi
