@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.2.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -15,6 +15,8 @@ BACKUP_ROOT="${BACKUP_ROOT:-/etc/reality443/backups}"
 STATE_DIR="${STATE_DIR:-/etc/reality443}"
 STATE_FILE="${STATE_DIR}/state.json"
 STREAM_FILE="${NGINX_DIR}/stream-reality443.conf"
+SITE_CONF="${SITE_CONF:-${NGINX_DIR}/conf.d/reality443-site.conf}"
+SITE_ROOT="${SITE_ROOT:-/var/www/reality443}"
 XUI_SERVICE="${XUI_SERVICE:-x-ui}"
 NGINX_SERVICE="${NGINX_SERVICE:-nginx}"
 
@@ -35,6 +37,8 @@ PANEL_HOST=""
 SUB_HOST=""
 PANEL_ROUTE="no"
 SUB_ROUTE="no"
+SITE_MODE="none"     # none | local | redirect
+SITE_TARGET=""       # redirect destination domain (no scheme)
 
 # ---------------------------------------------------------------------------
 # Runtime tables
@@ -127,6 +131,16 @@ banner() {
   fi
   banner_row "NGINX" "$n_state" "$n_note"
   banner_row "443 ROUTING" "$s_state" "$s_note"
+  local site_state="bad" site_note="no site"
+  if [ -f "$SITE_CONF" ]; then
+    site_state="ok"
+    if grep -q 'return 301' "$SITE_CONF" 2>/dev/null; then
+      site_note="redirect -> $(grep -oE 'https://[^$;]+' "$SITE_CONF" | head -n1 | sed 's|https://||')"
+    else
+      site_note="serving ${SITE_ROOT}"
+    fi
+  fi
+  banner_row "SITE :80" "$site_state" "$site_note"
   echo
 }
 
@@ -523,13 +537,17 @@ load_state() {
   SUB_HOST=$(jq -r '.sub_host // ""' "$STATE_FILE")
   PANEL_ROUTE=$(jq -r '.panel_route // "no"' "$STATE_FILE")
   SUB_ROUTE=$(jq -r '.sub_route // "no"' "$STATE_FILE")
+  SITE_MODE=$(jq -r '.site_mode // "none"' "$STATE_FILE")
+  SITE_TARGET=$(jq -r '.site_target // ""' "$STATE_FILE")
 }
 
 save_state() {
   mkdir -p "$STATE_DIR"
   jq -n --arg ph "$PUBLIC_HOST" --arg pa "$PANEL_HOST" --arg su "$SUB_HOST" \
         --arg pr "$PANEL_ROUTE" --arg sr "$SUB_ROUTE" \
-    '{public_host:$ph, panel_host:$pa, sub_host:$su, panel_route:$pr, sub_route:$sr}' > "$STATE_FILE"
+        --arg sm "$SITE_MODE" --arg st "$SITE_TARGET" \
+    '{public_host:$ph, panel_host:$pa, sub_host:$su, panel_route:$pr, sub_route:$sr,
+      site_mode:$sm, site_target:$st}' > "$STATE_FILE"
 }
 
 save_original_ports() {
@@ -1509,30 +1527,233 @@ manage_hosts() {
   done
 }
 
+# Strips any scheme/path the user pastes and validates a bare domain, so both
+# "example.com" and "https://example.com/x" are accepted and normalised.
+v_bare_domain() {
+  local x="$1"
+  x="${x#http://}"; x="${x#https://}"
+  x="${x%%/*}"
+  x="${x%%:*}"
+  if [[ "$x" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
+    printf '%s\n' "$x"; return 0
+  fi
+  err "Enter a domain like example.com (no https://)."
+  return 1
+}
+
+# Searches the usual web roots for an existing index.html to reuse as the
+# camouflage page. Prints candidate paths, newest first.
+find_index_candidates() {
+  local d
+  for d in /var/www/html /usr/share/nginx/html /var/www /usr/share/nginx \
+           /root /home /opt /srv; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 3 -name 'index.html' -type f 2>/dev/null
+  done | grep -v "^${SITE_ROOT}/" | awk '!seen[$0]++' | head -n 10
+}
+
+# Ensures nginx's http{} block actually includes conf.d/*.conf, otherwise our
+# site file would be written but never loaded.
+ensure_confd_included() {
+  mkdir -p "${NGINX_DIR}/conf.d"
+  grep -qE '^\s*include\s+[^;]*conf\.d/\*\.conf\s*;' "$NGINX_CONF" 2>/dev/null && return 0
+  # add the include just inside http {
+  local tmp; tmp=$(mktemp)
+  awk -v inc="    include ${NGINX_DIR}/conf.d/*.conf;" '
+    BEGIN { done=0 }
+    { print }
+    !done && $0 ~ /^[[:space:]]*http[[:space:]]*\{/ { print inc; done=1 }
+  ' "$NGINX_CONF" > "$tmp"
+  mv "$tmp" "$NGINX_CONF"
+  info "Added conf.d include to nginx.conf"
+}
+
+write_site_conf() {
+  ensure_confd_included
+  local tmp; tmp=$(mktemp)
+  if [ "$SITE_MODE" = "redirect" ]; then
+    {
+      echo "# Managed by reality-443.sh - camouflage site (redirect)"
+      echo "server {"
+      echo "    listen 80 default_server;"
+      echo "    listen [::]:80 default_server;"
+      echo "    server_name _;"
+      echo "    return 301 https://${SITE_TARGET}\$request_uri;"
+      echo "}"
+    } > "$tmp"
+  else
+    {
+      echo "# Managed by reality-443.sh - camouflage site (local files)"
+      echo "server {"
+      echo "    listen 80 default_server;"
+      echo "    listen [::]:80 default_server;"
+      echo "    server_name _;"
+      echo "    root ${SITE_ROOT};"
+      echo "    index index.html index.htm;"
+      echo "    location / {"
+      echo "        try_files \$uri \$uri/ /index.html;"
+      echo "    }"
+      echo "}"
+    } > "$tmp"
+  fi
+  mv "$tmp" "$SITE_CONF"
+  ok "Wrote ${SITE_CONF}"
+}
+
+# Another default_server on :80 makes nginx -t fail with a duplicate error.
+# Disable the distro's stock default site if it is still enabled.
+disable_stock_default_site() {
+  local f
+  for f in "${NGINX_DIR}/sites-enabled/default" "${NGINX_DIR}/conf.d/default.conf"; do
+    if [ -e "$f" ]; then
+      mv "$f" "${f}.reality443-disabled"
+      warn "Disabled conflicting default site: ${f}"
+    fi
+  done
+}
+
+apply_site() {
+  disable_stock_default_site
+  write_site_conf
+  if nginx -t 2>/tmp/r443.site.err; then
+    systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null || true
+    ok "Camouflage site is live on port 80."
+    return 0
+  fi
+  err "nginx config test failed - removing the site config again."
+  sed -n '1,20p' /tmp/r443.site.err >&2
+  rm -f "$SITE_CONF"
+  nginx -t >/dev/null 2>&1 && { systemctl reload "$NGINX_SERVICE" 2>/dev/null || true; }
+  return 1
+}
+
+site_menu() {
+  while true; do
+    header
+    load_state
+    printf '%sCurrent mode   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_MODE" "$R"
+    [ "$SITE_MODE" = "redirect" ] && printf '%sRedirects to   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_TARGET" "$R"
+    [ "$SITE_MODE" = "local" ] && printf '%sServing from   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_ROOT" "$R"
+    echo
+    line_c 0 "1) Serve a Local Site (auto-detect index.html)"
+    line_c 1 "2) Redirect to Another Site"
+    line_c 2 "3) Disable Site"
+    line_c 3 "0) Back"
+    local ch
+    printf '%sChoice%s: ' "$(next_c)" "$R"
+    IFS= read -r ch || ch=0
+    case "$ch" in
+      1) site_setup_local; pause ;;
+      2) site_setup_redirect; pause ;;
+      3) site_disable; pause ;;
+      0) return 0 ;;
+      *) err "Pick a number from the list."; pause ;;
+    esac
+  done
+}
+
+site_setup_local() {
+  local -a cands=()
+  mapfile -t cands < <(find_index_candidates)
+  local src=""
+  if [ "${#cands[@]}" -gt 0 ]; then
+    printf '%sFound these index.html files on this server:%s\n' "$C_PURPLE" "$R"
+    local k
+    for k in "${!cands[@]}"; do
+      printf '  %-3s %s\n' "$((k + 1))" "${cands[$k]}"
+    done
+    printf '  %-3s %s\n' "0" "enter a path manually"
+    echo
+    local pick
+    while true; do
+      printf '%sPick a file%s: ' "$(next_c)" "$R"
+      IFS= read -r pick || pick=""
+      if [ "$pick" = "0" ]; then src=""; break; fi
+      if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#cands[@]}" ]; then
+        src="${cands[$((pick - 1))]}"; break
+      fi
+      err "Pick a number from the list."
+    done
+  else
+    warn "No index.html found in the usual web roots."
+  fi
+
+  if [ -z "$src" ]; then
+    while true; do
+      printf '%sFull path to an index.html%s: ' "$(next_c)" "$R"
+      IFS= read -r src || src=""
+      [ -f "$src" ] && break
+      err "File not found: ${src:-<empty>}"
+    done
+  fi
+
+  mkdir -p "$SITE_ROOT"
+  # Copy the whole directory so CSS/JS/images next to index.html come along.
+  local srcdir; srcdir=$(dirname "$src")
+  if [ "$srcdir" = "$SITE_ROOT" ]; then
+    info "Source is already the site root - nothing to copy."
+  else
+    cp -a "${srcdir}/." "$SITE_ROOT"/ 2>/dev/null || cp -a "$src" "${SITE_ROOT}/index.html"
+    ok "Copied site files from ${srcdir} to ${SITE_ROOT}"
+  fi
+  [ -f "${SITE_ROOT}/index.html" ] || cp -a "$src" "${SITE_ROOT}/index.html"
+  chown -R www-data:www-data "$SITE_ROOT" 2>/dev/null || true
+
+  SITE_MODE="local"; SITE_TARGET=""
+  save_state
+  apply_site || return 1
+  info "Visit http://${PUBLIC_HOST:-<your-domain>} to check it."
+}
+
+site_setup_redirect() {
+  local dom
+  dom=$(ask "Site to redirect to (no https://)" v_bare_domain "$SITE_TARGET")
+  SITE_TARGET="$dom"; SITE_MODE="redirect"
+  save_state
+  apply_site || return 1
+  info "Port 80 now redirects to https://${SITE_TARGET}"
+}
+
+site_disable() {
+  local c; c=$(ask "Disable the camouflage site? [y/N]" v_yn "no")
+  [ "$c" = "yes" ] || { warn "Cancelled."; return 0; }
+  rm -f "$SITE_CONF"
+  SITE_MODE="none"; SITE_TARGET=""
+  save_state
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload "$NGINX_SERVICE" 2>/dev/null || true
+    ok "Camouflage site disabled."
+  else
+    err "nginx config test failed after removing the site."
+  fi
+}
+
 main_menu() {
   while true; do
     header
     line_c 0 "1) Setup 443 Routing"
     line_c 1 "2) Sync New Inbounds"
-    line_c 2 "3) Manage Hosts"
-    line_c 3 "4) Panel and Ports"
-    line_c 4 "5) Services"
-    line_c 5 "6) Diagnose"
-    line_c 6 "7) Rollback Last Change"
-    line_c 7 "8) Remove 443 Routing"
-    line_c 8 "0) Exit"
+    line_c 2 "3) Camouflage Site"
+    line_c 3 "4) Manage Hosts"
+    line_c 4 "5) Panel and Ports"
+    line_c 5 "6) Services"
+    line_c 6 "7) Diagnose"
+    line_c 7 "8) Rollback Last Change"
+    line_c 8 "9) Remove 443 Routing"
+    line_c 0 "0) Exit"
     local ch
     printf '%sChoice%s: ' "$(next_c)" "$R"
     IFS= read -r ch || ch=0
     case "$ch" in
       1) do_setup ;;
       2) do_sync ;;
-      3) manage_hosts ;;
-      4) panel_menu ;;
-      5) services_menu ;;
-      6) diagnose ;;
-      7) do_rollback ;;
-      8) do_remove ;;
+      3) site_menu ;;
+      4) manage_hosts ;;
+      5) panel_menu ;;
+      6) services_menu ;;
+      7) diagnose ;;
+      8) do_rollback ;;
+      9) do_remove ;;
       0) clear; exit 0 ;;
       *) err "Pick a number from the list."; pause ;;
     esac
