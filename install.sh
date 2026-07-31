@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.3.1"
+SCRIPT_VERSION="3.4.1"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -17,6 +17,8 @@ STATE_FILE="${STATE_DIR}/state.json"
 STREAM_FILE="${NGINX_DIR}/stream-reality443.conf"
 SITE_CONF="${SITE_CONF:-${NGINX_DIR}/conf.d/reality443-site.conf}"
 SITE_ROOT="${SITE_ROOT:-/var/www/reality443}"
+SITE_PORT="${SITE_PORT:-8081}"          # internal HTTPS port the site listens on
+CERT_SEARCH_DIRS="/root/cert /etc/letsencrypt/live /root/.acme.sh /etc/ssl/private /opt/cert"
 XUI_SERVICE="${XUI_SERVICE:-x-ui}"
 NGINX_SERVICE="${NGINX_SERVICE:-nginx}"
 
@@ -39,6 +41,9 @@ PANEL_ROUTE="no"
 SUB_ROUTE="no"
 SITE_MODE="none"     # none | local | redirect
 SITE_TARGET=""       # redirect destination domain (no scheme)
+SITE_DOMAIN=""       # domain the TLS cert belongs to (site's SNI on 443)
+SITE_CERT=""         # fullchain path
+SITE_KEY=""          # private key path
 
 # ---------------------------------------------------------------------------
 # Runtime tables
@@ -115,6 +120,7 @@ banner_row() {
 }
 
 banner() {
+  load_state 2>/dev/null || true
   local n_state="bad" s_state="bad" n_note="" s_note=""
   if have nginx; then
     case "$(stream_state)" in
@@ -134,13 +140,18 @@ banner() {
   local site_state="bad" site_note="no site"
   if [ -f "$SITE_CONF" ]; then
     site_state="ok"
-    if grep -q 'return 301' "$SITE_CONF" 2>/dev/null; then
-      site_note="redirect -> $(grep -oE 'https://[^$;]+' "$SITE_CONF" | head -n1 | sed 's|https://||')"
+    if [ -n "$SITE_DOMAIN" ]; then
+      site_note="https://${SITE_DOMAIN}"
     else
-      site_note="serving ${SITE_ROOT}"
+      site_note="http only (no cert)"
     fi
   fi
-  banner_row "SITE :80" "$site_state" "$site_note"
+  banner_row "SITE" "$site_state" "$site_note"
+  local fw_state="bad" fw_note="not active"
+  if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    fw_state="ok"; fw_note="ufw active"
+  fi
+  banner_row "FIREWALL" "$fw_state" "$fw_note"
   echo
 }
 
@@ -157,6 +168,16 @@ count_routed() {
 # Basics
 # ---------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Emitting "listen [::]:..." on a host without IPv6 makes nginx -t fail with
+# "Address family not supported by protocol", so every IPv6 listen line is
+# gated on this.
+has_ipv6() {
+  [ -f /proc/net/if_inet6 ] || return 1
+  [ -s /proc/net/if_inet6 ] || return 1
+  ip -6 addr show scope global 2>/dev/null | grep -q 'inet6' || return 1
+  return 0
+}
 
 # True if the address is a private/RFC1918 IP (a GRE/WireGuard tunnel address).
 # Such inbounds keep their listen IP - we still reassign the port and route to
@@ -599,6 +620,9 @@ load_state() {
   SUB_ROUTE=$(jq -r '.sub_route // "no"' "$STATE_FILE")
   SITE_MODE=$(jq -r '.site_mode // "none"' "$STATE_FILE")
   SITE_TARGET=$(jq -r '.site_target // ""' "$STATE_FILE")
+  SITE_DOMAIN=$(jq -r '.site_domain // ""' "$STATE_FILE")
+  SITE_CERT=$(jq -r '.site_cert // ""' "$STATE_FILE")
+  SITE_KEY=$(jq -r '.site_key // ""' "$STATE_FILE")
 }
 
 save_state() {
@@ -606,8 +630,9 @@ save_state() {
   jq -n --arg ph "$PUBLIC_HOST" --arg pa "$PANEL_HOST" --arg su "$SUB_HOST" \
         --arg pr "$PANEL_ROUTE" --arg sr "$SUB_ROUTE" \
         --arg sm "$SITE_MODE" --arg st "$SITE_TARGET" \
+        --arg sd "$SITE_DOMAIN" --arg sc "$SITE_CERT" --arg sk "$SITE_KEY" \
     '{public_host:$ph, panel_host:$pa, sub_host:$su, panel_route:$pr, sub_route:$sr,
-      site_mode:$sm, site_target:$st}' > "$STATE_FILE"
+      site_mode:$sm, site_target:$st, site_domain:$sd, site_cert:$sc, site_key:$sk}' > "$STATE_FILE"
 }
 
 save_original_ports() {
@@ -778,16 +803,25 @@ do_rollback() {
 # nginx stream config
 # ---------------------------------------------------------------------------
 write_stream_conf() {
-  local default_backend="" tmp i pport sport bip
+  local default_backend="" tmp i pport sport bip site_be=""
   tmp=$(mktemp)
-  for ((i = 0; i < ${#RI_ID[@]}; i++)); do
-    if is_routable_listen "${RI_LISTEN[$i]}" && [ -n "${RI_SNI[$i]}" ]; then
-      default_backend="$(backend_ip "${RI_LISTEN[$i]}"):${RI_PORT[$i]}"
-      break
-    fi
-  done
+  # A configured camouflage site becomes the default backend: any TLS hello
+  # whose SNI we do not recognise then lands on a real website instead of a
+  # proxy inbound, which is exactly what a prober should see.
+  if [ -f "$SITE_CONF" ] && [ -n "$SITE_DOMAIN" ]; then
+    site_be="127.0.0.1:${SITE_PORT}"
+    default_backend="$site_be"
+  fi
   if [ -z "$default_backend" ]; then
-    err "No consolidated inbound found - nothing to route."
+    for ((i = 0; i < ${#RI_ID[@]}; i++)); do
+      if is_routable_listen "${RI_LISTEN[$i]}" && [ -n "${RI_SNI[$i]}" ]; then
+        default_backend="$(backend_ip "${RI_LISTEN[$i]}"):${RI_PORT[$i]}"
+        break
+      fi
+    done
+  fi
+  if [ -z "$default_backend" ]; then
+    err "No consolidated inbound and no site - nothing to route."
     rm -f "$tmp"; return 1
   fi
 
@@ -815,11 +849,14 @@ write_stream_conf() {
       sport=$(sub_port)
       printf '    "%s" 127.0.0.1:%s;\n' "$SUB_HOST" "$sport"
     fi
+    if [ -n "$site_be" ]; then
+      printf '    "%s" %s;\n' "$SITE_DOMAIN" "$site_be"
+    fi
     echo "}"
     echo ""
     echo "server {"
     echo "    listen 443 reuseport;"
-    echo "    listen [::]:443 reuseport;"
+    has_ipv6 && echo "    listen [::]:443 reuseport;"
     echo "    proxy_pass \$reality443;"
     echo "    ssl_preread on;"
     echo "    proxy_timeout 1h;"
@@ -1237,14 +1274,22 @@ do_setup() {
     SUB_HOST=""
   fi
 
-  # Camouflage site on port 80 - all questions asked here so a fresh install is
-  # one uninterrupted pass; the site itself is applied after 443 is live.
+  # Camouflage site - all questions asked here so a fresh install is one
+  # uninterrupted pass; the site itself is applied after 443 is live.
+  echo
+  printf '%sCamouflage site%s\n' "$C_PURPLE" "$R"
+  line_c 0 "  1) Serve Local Files"
+  line_c 1 "  2) Redirect to Another Site"
+  line_c 2 "  3) Skip"
   local site_choice
-  site_choice=$(ask "Camouflage site on port 80? 1=local files 2=redirect 3=skip" v_site_choice "3")
+  site_choice=$(ask "Choice" v_site_choice "3")
   case "$site_choice" in
     1) site_pick_local || site_choice=3 ;;
     2) site_ask_redirect || site_choice=3 ;;
   esac
+
+  local fw_choice
+  fw_choice=$(ask "Install and enable the firewall (ufw)? [y/N]" v_yn "no")
 
   # Plan internal ports
   local -a plan_port=()
@@ -1272,10 +1317,12 @@ do_setup() {
   printf '  Panel via 443            %s%s\n' "$PANEL_ROUTE" "$([ "$PANEL_ROUTE" = yes ] && printf ' (%s -> :%s)' "$PANEL_HOST" "$(panel_port)")"
   printf '  Subscription via 443     %s%s\n' "$SUB_ROUTE" "$([ "$SUB_ROUTE" = yes ] && printf ' (%s -> :%s)' "$SUB_HOST" "$(sub_port)")"
   case "$site_choice" in
-    1) printf '  Site on :80              local files from %s\n' "$SITE_SRC" ;;
-    2) printf '  Site on :80              redirect to https://%s\n' "$SITE_TARGET" ;;
-    *) printf '  Site on :80              none\n' ;;
+    1) printf '  Site                     local files from %s\n' "$SITE_SRC" ;;
+    2) printf '  Site                     redirect to https://%s\n' "$SITE_TARGET" ;;
+    *) printf '  Site                     none\n' ;;
   esac
+  [ -n "$SITE_DOMAIN" ] && printf '  Site certificate         %s\n' "$SITE_DOMAIN"
+  printf '  Firewall (ufw)           %s\n' "$fw_choice"
   echo
   warn "Existing users will be disconnected until they get updated links."
   local go; go=$(ask "Apply now? [y/N]" v_yn "no")
@@ -1325,6 +1372,11 @@ do_setup() {
     1) echo; site_apply_local || warn "Camouflage site was not set up." ;;
     2) echo; site_apply_redirect || warn "Camouflage site was not set up." ;;
   esac
+
+  if [ "$fw_choice" = "yes" ]; then
+    echo
+    setup_firewall || warn "Firewall was not configured."
+  fi
 
   echo
   printf '%sSample links%s\n' "$C_PURPLE" "$R"
@@ -1646,8 +1698,66 @@ v_bare_domain() {
   return 1
 }
 
-# Searches the usual web roots for an existing index.html to reuse as the
-# camouflage page. Prints candidate paths, newest first.
+# ---------------------------------------------------------------------------
+# TLS certificate discovery
+# ---------------------------------------------------------------------------
+# Prints "<domain>|<fullchain>|<privkey>" for every usable cert pair found.
+find_cert_pairs() {
+  local base d chain key dom
+  for base in $CERT_SEARCH_DIRS; do
+    [ -d "$base" ] || continue
+    while IFS= read -r chain; do
+      [ -f "$chain" ] || continue
+      d=$(dirname "$chain")
+      key=""
+      for k in privkey.pem private.key key.pem privkey.key "$(basename "$d").key"; do
+        [ -f "${d}/${k}" ] && { key="${d}/${k}"; break; }
+      done
+      if [ -z "$key" ]; then
+        key=$(find "$d" -maxdepth 1 -name '*.key' -type f 2>/dev/null | head -n1)
+      fi
+      [ -n "$key" ] || continue
+      dom=$(basename "$d")
+      printf '%s|%s|%s\n' "$dom" "$chain" "$key"
+    done < <(find "$base" -maxdepth 3 \( -name 'fullchain.pem' -o -name 'fullchain.cer' -o -name 'cert.pem' \) -type f 2>/dev/null)
+  done | awk -F'|' '!seen[$1]++'
+}
+
+# Picks a cert: single match is used automatically, several are offered as a list.
+choose_cert() {
+  local -a pairs=()
+  mapfile -t pairs < <(find_cert_pairs)
+  if [ "${#pairs[@]}" -eq 0 ]; then
+    warn "No TLS certificate found under: ${CERT_SEARCH_DIRS}"
+    return 1
+  fi
+  if [ "${#pairs[@]}" -eq 1 ]; then
+    IFS='|' read -r SITE_DOMAIN SITE_CERT SITE_KEY <<< "${pairs[0]}"
+    ok "Using certificate for ${SITE_DOMAIN}"
+    return 0
+  fi
+  printf '%sCertificates found on this server:%s\n' "$C_PURPLE" "$R"
+  local k dom
+  for k in "${!pairs[@]}"; do
+    dom="${pairs[$k]%%|*}"
+    printf '  %-3s %s\n' "$((k + 1))" "$dom"
+  done
+  local pick
+  while true; do
+    printf '%sPick a certificate%s: ' "$(next_c)" "$R"
+    IFS= read -r pick || pick=""
+    if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#pairs[@]}" ]; then
+      IFS='|' read -r SITE_DOMAIN SITE_CERT SITE_KEY <<< "${pairs[$((pick - 1))]}"
+      ok "Using certificate for ${SITE_DOMAIN}"
+      return 0
+    fi
+    err "Pick a number from the list."
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Camouflage site
+# ---------------------------------------------------------------------------
 find_index_candidates() {
   local d
   for d in /var/www/html /usr/share/nginx/html /var/www /usr/share/nginx \
@@ -1657,12 +1767,11 @@ find_index_candidates() {
   done | grep -v "^${SITE_ROOT}/" | awk '!seen[$0]++' | head -n 10
 }
 
-# Ensures nginx's http{} block actually includes conf.d/*.conf, otherwise our
-# site file would be written but never loaded.
+# nginx must actually include conf.d/*.conf from http{}, or our site file is
+# written but never loaded.
 ensure_confd_included() {
   mkdir -p "${NGINX_DIR}/conf.d"
-  grep -qE '^\s*include\s+[^;]*conf\.d/\*\.conf\s*;' "$NGINX_CONF" 2>/dev/null && return 0
-  # add the include just inside http {
+  grep -qE "^[[:space:]]*include[[:space:]]+[^;]*conf\.d/\*\.conf[[:space:]]*;" "$NGINX_CONF" 2>/dev/null && return 0
   local tmp; tmp=$(mktemp)
   awk -v inc="    include ${NGINX_DIR}/conf.d/*.conf;" '
     BEGIN { done=0 }
@@ -1670,43 +1779,61 @@ ensure_confd_included() {
     !done && $0 ~ /^[[:space:]]*http[[:space:]]*\{/ { print inc; done=1 }
   ' "$NGINX_CONF" > "$tmp"
   mv "$tmp" "$NGINX_CONF"
-  info "Added conf.d include to nginx.conf"
+  info "Added conf.d include to ${NGINX_CONF}"
 }
 
+# Writes the site server blocks:
+#   :80                    -> permanent redirect to https (plus the site itself
+#                             if no cert is available)
+#   127.0.0.1:SITE_PORT    -> TLS site, reached from the 443 stream map by SNI
 write_site_conf() {
   ensure_confd_included
   local tmp; tmp=$(mktemp)
-  if [ "$SITE_MODE" = "redirect" ]; then
-    {
-      echo "# Managed by reality-443.sh - camouflage site (redirect)"
-      echo "server {"
-      echo "    listen 80 default_server;"
-      echo "    listen [::]:80 default_server;"
-      echo "    server_name _;"
+  {
+    echo "# Managed by reality-443.sh v${SCRIPT_VERSION} - do not edit by hand."
+    echo "server {"
+    echo "    listen 80 default_server;"
+    has_ipv6 && echo "    listen [::]:80 default_server;"
+    echo "    server_name _;"
+    if [ -n "$SITE_DOMAIN" ]; then
+      echo "    return 301 https://\$host\$request_uri;"
+    elif [ "$SITE_MODE" = "redirect" ]; then
       echo "    return 301 https://${SITE_TARGET}\$request_uri;"
-      echo "}"
-    } > "$tmp"
-  else
-    {
-      echo "# Managed by reality-443.sh - camouflage site (local files)"
-      echo "server {"
-      echo "    listen 80 default_server;"
-      echo "    listen [::]:80 default_server;"
-      echo "    server_name _;"
+    else
       echo "    root ${SITE_ROOT};"
       echo "    index index.html index.htm;"
-      echo "    location / {"
-      echo "        try_files \$uri \$uri/ /index.html;"
-      echo "    }"
+      echo "    location / { try_files \$uri \$uri/ /index.html; }"
+    fi
+    echo "}"
+    if [ -n "$SITE_DOMAIN" ] && [ -n "$SITE_CERT" ] && [ -n "$SITE_KEY" ]; then
+      echo ""
+      echo "server {"
+      echo "    listen 127.0.0.1:${SITE_PORT} ssl;"
+      echo "    server_name ${SITE_DOMAIN};"
+      echo "    ssl_certificate ${SITE_CERT};"
+      echo "    ssl_certificate_key ${SITE_KEY};"
+      echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+      echo "    ssl_session_cache shared:R443SSL:10m;"
+      if [ "$SITE_MODE" = "redirect" ]; then
+        echo "    return 301 https://${SITE_TARGET}\$request_uri;"
+      else
+        echo "    root ${SITE_ROOT};"
+        echo "    index index.html index.htm;"
+        echo "    location / { try_files \$uri \$uri/ /index.html; }"
+      fi
       echo "}"
-    } > "$tmp"
+    fi
+  } > "$tmp"
+  mkdir -p "$(dirname "$SITE_CONF")"
+  if ! mv "$tmp" "$SITE_CONF" 2>/tmp/r443.sitemv.err; then
+    err "Could not write ${SITE_CONF}:"
+    sed -n '1,5p' /tmp/r443.sitemv.err >&2
+    rm -f "$tmp"; return 1
   fi
-  mv "$tmp" "$SITE_CONF"
   ok "Wrote ${SITE_CONF}"
 }
 
-# Another default_server on :80 makes nginx -t fail with a duplicate error.
-# Disable the distro's stock default site if it is still enabled.
+# A second default_server on :80 makes nginx -t fail with a duplicate error.
 disable_stock_default_site() {
   local f
   for f in "${NGINX_DIR}/sites-enabled/default" "${NGINX_DIR}/conf.d/default.conf"; do
@@ -1719,59 +1846,42 @@ disable_stock_default_site() {
 
 apply_site() {
   disable_stock_default_site
-  write_site_conf
+  write_site_conf || return 1
+  # The site's SNI has to be in the 443 stream map, otherwise nothing on 443
+  # ever reaches it.
+  load_inbounds
+  write_stream_conf || return 1
   if nginx -t 2>/tmp/r443.site.err; then
     systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null || true
-    ok "Camouflage site is live on port 80."
+    if [ -n "$SITE_DOMAIN" ]; then
+      ok "Site is live on https://${SITE_DOMAIN} (and http:// redirects to it)."
+    else
+      ok "Site is live on port 80."
+    fi
     return 0
   fi
-  err "nginx config test failed - removing the site config again."
+  err "nginx config test failed - rolling the site config back."
   sed -n '1,20p' /tmp/r443.site.err >&2
   rm -f "$SITE_CONF"
+  SITE_MODE="none"; save_state
+  load_inbounds; write_stream_conf >/dev/null 2>&1 || true
   nginx -t >/dev/null 2>&1 && { systemctl reload "$NGINX_SERVICE" 2>/dev/null || true; }
   return 1
 }
 
-site_menu() {
-  while true; do
-    header
-    load_state
-    printf '%sCurrent mode   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_MODE" "$R"
-    [ "$SITE_MODE" = "redirect" ] && printf '%sRedirects to   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_TARGET" "$R"
-    [ "$SITE_MODE" = "local" ] && printf '%sServing from   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_ROOT" "$R"
-    echo
-    line_c 0 "1) Serve a Local Site (auto-detect index.html)"
-    line_c 1 "2) Redirect to Another Site"
-    line_c 2 "3) Disable Site"
-    line_c 3 "0) Back"
-    local ch
-    printf '%sChoice%s: ' "$(next_c)" "$R"
-    IFS= read -r ch || ch=0
-    case "$ch" in
-      1) site_pick_local && site_apply_local; pause ;;
-      2) site_setup_redirect; pause ;;
-      3) site_disable; pause ;;
-      0) return 0 ;;
-      *) err "Pick a number from the list."; pause ;;
-    esac
-  done
-}
-
-# Phase 1: pick the source index.html. Sets SITE_SRC. Asked up front so the
-# whole install is one uninterrupted run of questions.
+# ---- phase 1: questions (asked up front) ----------------------------------
 SITE_SRC=""
 site_pick_local() {
   local -a cands=()
   mapfile -t cands < <(find_index_candidates)
   local src=""
   if [ "${#cands[@]}" -gt 0 ]; then
-    printf '%sFound these index.html files on this server:%s\n' "$C_PURPLE" "$R"
+    printf '%sindex.html files found on this server:%s\n' "$C_PURPLE" "$R"
     local k
     for k in "${!cands[@]}"; do
       printf '  %-3s %s\n' "$((k + 1))" "${cands[$k]}"
     done
     printf '  %-3s %s\n' "0" "enter a path manually"
-    echo
     local pick
     while true; do
       printf '%sPick a file%s: ' "$(next_c)" "$R"
@@ -1785,7 +1895,6 @@ site_pick_local() {
   else
     warn "No index.html found in the usual web roots."
   fi
-
   if [ -z "$src" ]; then
     while true; do
       printf '%sFull path to an index.html%s: ' "$(next_c)" "$R"
@@ -1795,10 +1904,19 @@ site_pick_local() {
     done
   fi
   SITE_SRC="$src"
+  choose_cert || warn "The site will only be reachable over http:// until a certificate exists."
   return 0
 }
 
-# Phase 2: copy the chosen site into place and activate it.
+site_ask_redirect() {
+  local dom
+  dom=$(ask "Site to redirect to (no https://)" v_bare_domain "$SITE_TARGET")
+  SITE_TARGET="$dom"
+  choose_cert || warn "The redirect will only work over http:// until a certificate exists."
+  return 0
+}
+
+# ---- phase 2: apply --------------------------------------------------------
 # shellcheck disable=SC2120  # optional arg, normally uses SITE_SRC
 site_apply_local() {
   local src="${1:-$SITE_SRC}"
@@ -1807,7 +1925,6 @@ site_apply_local() {
     return 1
   fi
   mkdir -p "$SITE_ROOT"
-  # Copy the whole directory so CSS/JS/images next to index.html come along.
   local srcdir; srcdir=$(dirname "$src")
   if [ "$srcdir" = "$SITE_ROOT" ]; then
     info "Source is already the site root - nothing to copy."
@@ -1817,45 +1934,106 @@ site_apply_local() {
   fi
   [ -f "${SITE_ROOT}/index.html" ] || cp -a "$src" "${SITE_ROOT}/index.html"
   chown -R www-data:www-data "$SITE_ROOT" 2>/dev/null || true
-
+  chmod -R a+rX "$SITE_ROOT" 2>/dev/null || true
   SITE_MODE="local"; SITE_TARGET=""
   save_state
-  apply_site || return 1
-  info "Visit http://${PUBLIC_HOST:-<your-domain>} to check it."
-}
-
-site_ask_redirect() {
-  local dom
-  dom=$(ask "Site to redirect to (no https://)" v_bare_domain "$SITE_TARGET")
-  SITE_TARGET="$dom"
-  return 0
+  apply_site
 }
 
 site_apply_redirect() {
   [ -n "$SITE_TARGET" ] || { err "No redirect target set."; return 1; }
   SITE_MODE="redirect"
   save_state
-  apply_site || return 1
-  info "Port 80 now redirects to https://${SITE_TARGET}"
-}
-
-site_setup_redirect() {
-  site_ask_redirect || return 1
-  site_apply_redirect
+  apply_site
 }
 
 site_disable() {
-  local c; c=$(ask "Disable the camouflage site? [y/N]" v_yn "no")
+  local c; c=$(ask "Disable the site? [y/N]" v_yn "no")
   [ "$c" = "yes" ] || { warn "Cancelled."; return 0; }
   rm -f "$SITE_CONF"
-  SITE_MODE="none"; SITE_TARGET=""
+  SITE_MODE="none"; SITE_TARGET=""; SITE_DOMAIN=""; SITE_CERT=""; SITE_KEY=""
   save_state
+  load_inbounds; write_stream_conf >/dev/null 2>&1 || true
   if nginx -t >/dev/null 2>&1; then
     systemctl reload "$NGINX_SERVICE" 2>/dev/null || true
-    ok "Camouflage site disabled."
+    ok "Site disabled."
   else
     err "nginx config test failed after removing the site."
   fi
+}
+
+site_menu() {
+  while true; do
+    header
+    load_state
+    printf '%sMode        %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_MODE" "$R"
+    [ -n "$SITE_DOMAIN" ] && printf '%sDomain      %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_DOMAIN" "$R"
+    [ "$SITE_MODE" = "redirect" ] && printf '%sRedirects   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_TARGET" "$R"
+    [ "$SITE_MODE" = "local" ] && printf '%sFiles       %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_ROOT" "$R"
+    echo
+    line_c 0 "1) Serve Local Files"
+    line_c 1 "2) Redirect to Another Site"
+    line_c 2 "3) Change Certificate"
+    line_c 3 "4) Disable Site"
+    line_c 4 "0) Back"
+    local ch
+    printf '%sChoice%s: ' "$(next_c)" "$R"
+    IFS= read -r ch || ch=0
+    case "$ch" in
+      1) site_pick_local && site_apply_local; pause ;;
+      2) site_ask_redirect && site_apply_redirect; pause ;;
+      3) if choose_cert; then
+           save_state
+           [ "$SITE_MODE" = "none" ] && warn "No site configured yet - set one up first."
+           [ "$SITE_MODE" != "none" ] && apply_site
+         fi
+         pause ;;
+      4) site_disable; pause ;;
+      0) return 0 ;;
+      *) err "Pick a number from the list."; pause ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Firewall
+# ---------------------------------------------------------------------------
+ssh_port() {
+  local p
+  p=$(grep -oE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | grep -oE '[0-9]+' | head -n1)
+  [ -n "$p" ] || p=22
+  printf '%s\n' "$p"
+}
+
+setup_firewall() {
+  local sp; sp=$(ssh_port)
+  if ! have ufw; then
+    info "Installing ufw..."
+    install_pkgs ufw >/dev/null 2>&1 || true
+  fi
+  if ! have ufw; then
+    err "Could not install ufw on this system."
+    return 1
+  fi
+  # SSH first - enabling ufw without it would lock this session out.
+  ufw allow "${sp}/tcp" >/dev/null 2>&1 || true
+  ok "Allowed SSH on port ${sp}"
+  ufw allow 80/tcp  >/dev/null 2>&1 || true
+  ufw allow 443/tcp >/dev/null 2>&1 || true
+  ok "Allowed 80/tcp and 443/tcp"
+  if [ "$PANEL_ROUTE" != "yes" ]; then
+    local pp; pp=$(panel_port)
+    ufw allow "${pp}/tcp" >/dev/null 2>&1 || true
+    ok "Allowed panel port ${pp}/tcp"
+  fi
+  ufw --force enable >/dev/null 2>&1 || true
+  if ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    ok "Firewall is active."
+    ufw status numbered 2>/dev/null | sed -n '1,15p'
+  else
+    warn "ufw did not report active - check 'ufw status'."
+  fi
+  return 0
 }
 
 main_menu() {
@@ -1864,12 +2042,13 @@ main_menu() {
     line_c 0 "1) Setup 443 Routing"
     line_c 1 "2) Sync New Inbounds"
     line_c 2 "3) Camouflage Site"
-    line_c 3 "4) Manage Hosts"
-    line_c 4 "5) Panel and Ports"
-    line_c 5 "6) Services"
-    line_c 6 "7) Diagnose"
-    line_c 7 "8) Rollback Last Change"
-    line_c 8 "9) Remove 443 Routing"
+    line_c 3 "4) Firewall"
+    line_c 4 "5) Manage Hosts"
+    line_c 5 "6) Panel and Ports"
+    line_c 6 "7) Services"
+    line_c 7 "8) Diagnose"
+    line_c 8 "9) Rollback Last Change"
+    line_c 1 "10) Remove 443 Routing"
     line_c 0 "0) Exit"
     local ch
     printf '%sChoice%s: ' "$(next_c)" "$R"
@@ -1878,12 +2057,13 @@ main_menu() {
       1) do_setup ;;
       2) do_sync ;;
       3) site_menu ;;
-      4) manage_hosts ;;
-      5) panel_menu ;;
-      6) services_menu ;;
-      7) diagnose ;;
-      8) do_rollback ;;
-      9) do_remove ;;
+      4) header; setup_firewall; pause ;;
+      5) manage_hosts ;;
+      6) panel_menu ;;
+      7) services_menu ;;
+      8) diagnose ;;
+      9) do_rollback ;;
+      10) do_remove ;;
       0) clear; exit 0 ;;
       *) err "Pick a number from the list."; pause ;;
     esac
