@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.5.1"
+SCRIPT_VERSION="3.6.1"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -42,6 +42,7 @@ SUB_ROUTE="no"
 SITE_MODE="none"     # none | local | redirect
 SITE_TARGET=""       # redirect destination domain (no scheme)
 SITE_DOMAIN=""       # domain the TLS cert belongs to (site's SNI on 443)
+SITE_BIND_PORT=""    # actual free loopback port the site listens on
 SITE_CERT=""         # fullchain path
 SITE_KEY=""          # private key path
 
@@ -623,6 +624,8 @@ load_state() {
   SITE_DOMAIN=$(jq -r '.site_domain // ""' "$STATE_FILE")
   SITE_CERT=$(jq -r '.site_cert // ""' "$STATE_FILE")
   SITE_KEY=$(jq -r '.site_key // ""' "$STATE_FILE")
+  SITE_BIND_PORT=$(jq -r '.site_bind_port // ""' "$STATE_FILE")
+  [ -n "$SITE_BIND_PORT" ] && SITE_PORT="$SITE_BIND_PORT"
 }
 
 save_state() {
@@ -631,8 +634,10 @@ save_state() {
         --arg pr "$PANEL_ROUTE" --arg sr "$SUB_ROUTE" \
         --arg sm "$SITE_MODE" --arg st "$SITE_TARGET" \
         --arg sd "$SITE_DOMAIN" --arg sc "$SITE_CERT" --arg sk "$SITE_KEY" \
+        --arg sbp "$SITE_PORT" \
     '{public_host:$ph, panel_host:$pa, sub_host:$su, panel_route:$pr, sub_route:$sr,
-      site_mode:$sm, site_target:$st, site_domain:$sd, site_cert:$sc, site_key:$sk}' > "$STATE_FILE"
+      site_mode:$sm, site_target:$st, site_domain:$sd, site_cert:$sc, site_key:$sk,
+      site_bind_port:$sbp}' > "$STATE_FILE"
 }
 
 save_original_ports() {
@@ -934,14 +939,53 @@ find_toplevel_stream() {
   ' "$f"
 }
 
+# Adds our include just before the closing brace of the stream {} block that
+# starts on line $2. nginx allows only ONE top-level stream block, so when the
+# user already has one we must extend it rather than append a second.
+insert_include_into_stream() {
+  local file="$1" startline="$2" tmp
+  tmp=$(mktemp)
+  awk -v startline="$startline" -v inc="    include ${STREAM_FILE};" '
+    BEGIN { depth = 0; inserted = 0; started = 0 }
+    {
+      line = $0
+      plain = $0
+      sub(/#.*/, "", plain)
+      if (NR == startline) { started = 1 }
+      if (started && !inserted) {
+        n = length(plain)
+        for (i = 1; i <= n; i++) {
+          c = substr(plain, i, 1)
+          if (c == "{") depth++
+          else if (c == "}") {
+            depth--
+            if (depth == 0) { print inc; inserted = 1 }
+          }
+        }
+      }
+      print line
+    }
+    END { if (!inserted) exit 1 }
+  ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  # sanity: the include must now be present exactly once
+  if ! grep -qF "$STREAM_FILE" "$tmp"; then rm -f "$tmp"; return 1; fi
+  mv "$tmp" "$file"
+  return 0
+}
+
 hook_stream_include() {
   if grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null; then return 0; fi
 
   local hit; hit=$(find_toplevel_stream "$NGINX_CONF" || true)
   if [ -n "$hit" ]; then
-    warn "An existing top-level stream {} block was found in nginx.conf (line ${hit})."
-    warn "Add this line inside it manually, then re-run:"
-    warn "    include ${STREAM_FILE};"
+    warn "An existing top-level stream {} block was found at ${NGINX_CONF}:${hit}"
+    info "Inserting our include into it instead of adding a second block."
+    if insert_include_into_stream "$NGINX_CONF" "$hit"; then
+      ok "Added the include to the existing stream {} block."
+      return 0
+    fi
+    err "Could not modify the existing stream block. Add this line inside it by hand:"
+    err "    include ${STREAM_FILE};"
     return 1
   fi
 
@@ -1236,22 +1280,35 @@ pick_inbounds() {
   done
 }
 
+# Validates the selection and prints the usable subset on stdout.
+# - inbounds with no serverName are skipped with a warning (they simply cannot
+#   be routed by SNI) instead of aborting the whole run
+# - two selected inbounds sharing an SNI IS fatal: one of them would silently
+#   never receive traffic, and only the operator can decide which is right
+SNI_OK=()
 check_sni_unique() {
   local -A owner=()
-  local idx s
+  local idx s rem
+  SNI_OK=()
   for idx in "$@"; do
     s="${RI_SNI[$((idx - 1))]}"
+    rem="${RI_REMARK[$((idx - 1))]}"
     if [ -z "$s" ]; then
-      err "'${RI_REMARK[$((idx - 1))]}' has no Reality serverName - it cannot be routed by SNI."
-      return 1
+      warn "Skipping '${rem}': it has no Reality serverName, so it cannot be routed by SNI."
+      continue
     fi
     if [ -n "${owner[$s]:-}" ]; then
-      err "SNI '${s}' is used by both '${owner[$s]}' and '${RI_REMARK[$((idx - 1))]}'."
+      err "SNI '${s}' is used by both '${owner[$s]}' and '${rem}'."
       err "Give each inbound a unique serverName in the panel, then re-run."
       return 1
     fi
-    owner[$s]="${RI_REMARK[$((idx - 1))]}"
+    owner[$s]="$rem"
+    SNI_OK+=("$idx")
   done
+  if [ "${#SNI_OK[@]}" -eq 0 ]; then
+    err "None of the selected inbounds have a serverName - nothing can be routed."
+    return 1
+  fi
   return 0
 }
 
@@ -1291,6 +1348,7 @@ do_setup() {
   mapfile -t sel < <(pick_inbounds)
   if [ "${#sel[@]}" -eq 0 ]; then warn "Nothing selected."; pause; return 0; fi
   check_sni_unique "${sel[@]}" || { pause; return 0; }
+  sel=("${SNI_OK[@]}")
 
   install_nginx || { pause; return 0; }
   if http_binds_443; then
@@ -1477,6 +1535,7 @@ do_sync() {
     local go; go=$(ask "Route them now? [y/N]" v_yn "yes")
     if [ "$go" = "yes" ]; then
       check_sni_unique "${pending[@]}" || { pause; return 0; }
+      pending=("${SNI_OK[@]}")
       backup_now >/dev/null
       systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
       local idx p
@@ -1681,14 +1740,29 @@ do_remove() {
   # ---- 3. nginx: stream block, stream file, site file ----------------------
   unhook_stream_include
   rm -f "$STREAM_FILE" "$SITE_CONF"
-  # put back any distro default site we moved aside
-  local f
-  for f in "${NGINX_DIR}/sites-enabled/default.reality443-disabled" \
-           "${NGINX_DIR}/conf.d/default.conf.reality443-disabled"; do
-    if [ -e "$f" ]; then
-      mv "$f" "${f%.reality443-disabled}"
-      ok "Restored ${f%.reality443-disabled}"
-    fi
+  # put back any distro site files we moved aside
+  local f base
+  if [ -d "$DISABLED_DIR" ]; then
+    for f in "$DISABLED_DIR"/*; do
+      [ -e "$f" ] || continue
+      base=$(basename "$f")
+      if [ "$base" = "default.conf" ]; then
+        mv -f "$f" "${NGINX_DIR}/conf.d/${base}"
+        ok "Restored ${NGINX_DIR}/conf.d/${base}"
+      else
+        mkdir -p "${NGINX_DIR}/sites-enabled"
+        mv -f "$f" "${NGINX_DIR}/sites-enabled/${base}"
+        ok "Restored ${NGINX_DIR}/sites-enabled/${base}"
+      fi
+    done
+    rmdir "$DISABLED_DIR" 2>/dev/null || true
+  fi
+  # also undo any in-place renames left by older versions
+  for f in "${NGINX_DIR}"/sites-enabled/*.reality443-disabled \
+           "${NGINX_DIR}"/conf.d/*.reality443-disabled; do
+    [ -e "$f" ] || continue
+    mv -f "$f" "${f%.reality443-disabled}"
+    ok "Restored ${f%.reality443-disabled}"
   done
 
   # ---- 4. website files (optional) -----------------------------------------
@@ -1883,6 +1957,29 @@ ensure_confd_included() {
 #   :80                    -> permanent redirect to https (plus the site itself
 #                             if no cert is available)
 #   127.0.0.1:SITE_PORT    -> TLS site, reached from the 443 stream map by SNI
+# The site's loopback port must be genuinely free: a hardcoded 8081 collides
+# with whatever else the box happens to run and nginx then fails to bind.
+pick_site_port() {
+  local p="${SITE_PORT:-8081}" limit=$((${SITE_PORT:-8081} + 200))
+  refresh_taken_ports 2>/dev/null || true
+  while [ "$p" -le "$limit" ]; do
+    if [ -z "${TAKEN_PORTS[$p]:-}" ] && ! port_busy "$p"; then
+      if [ "$p" != "${SITE_PORT:-}" ]; then
+        info "Site port ${SITE_PORT} was busy - using ${p} instead."
+      fi
+      SITE_PORT="$p"
+      return 0
+    fi
+    # a port we ourselves already assigned to the site is fine to reuse
+    if [ "$p" = "${SITE_BIND_PORT:-}" ] && ! port_busy "$p"; then
+      SITE_PORT="$p"; return 0
+    fi
+    p=$((p + 1))
+  done
+  err "No free loopback port for the site between ${SITE_PORT} and ${limit}."
+  return 1
+}
+
 write_site_conf() {
   ensure_confd_included
   local tmp; tmp=$(mktemp)
@@ -1931,18 +2028,42 @@ write_site_conf() {
 }
 
 # A second default_server on :80 makes nginx -t fail with a duplicate error.
+# The file has to be MOVED OUT of nginx's tree, not just renamed: Debian's
+# nginx.conf includes "sites-enabled/*" (no .conf suffix), so a renamed file in
+# that directory is still loaded and still collides.
+DISABLED_DIR="${STATE_DIR}/disabled-sites"
 disable_stock_default_site() {
-  local f
-  for f in "${NGINX_DIR}/sites-enabled/default" "${NGINX_DIR}/conf.d/default.conf"; do
-    if [ -e "$f" ]; then
-      mv "$f" "${f}.reality443-disabled"
-      warn "Disabled conflicting default site: ${f}"
-    fi
+  mkdir -p "$DISABLED_DIR"
+  local f base
+  for f in "${NGINX_DIR}"/sites-enabled/* "${NGINX_DIR}"/conf.d/default.conf; do
+    [ -e "$f" ] || continue
+    # never touch our own file
+    case "$f" in *reality443*) continue ;; esac
+    # only files that actually declare a default_server on :80 or :443
+    grep -qE 'listen[^;]*default_server' "$f" 2>/dev/null || continue
+    base=$(basename "$f")
+    mv -f "$f" "${DISABLED_DIR}/${base}"
+    warn "Moved conflicting default site out of nginx: ${f}"
+    info "  (kept at ${DISABLED_DIR}/${base}, restored by Remove)"
+  done
+  # clean up files an older version renamed in place - those are still loaded
+  # by a "sites-enabled/*" glob and would keep breaking nginx -t.
+  for f in "${NGINX_DIR}"/sites-enabled/*.reality443-disabled \
+           "${NGINX_DIR}"/conf.d/*.reality443-disabled; do
+    [ -e "$f" ] || continue
+    base=$(basename "$f" .reality443-disabled)
+    mv -f "$f" "${DISABLED_DIR}/${base}"
+    warn "Cleaned up previously renamed site: $(basename "$f")"
   done
 }
 
 apply_site() {
   disable_stock_default_site
+  if [ -n "$SITE_DOMAIN" ]; then
+    pick_site_port || return 1
+    SITE_BIND_PORT="$SITE_PORT"
+    save_state
+  fi
   write_site_conf || return 1
   # The site's SNI has to be in the 443 stream map, otherwise nothing on 443
   # ever reaches it.
