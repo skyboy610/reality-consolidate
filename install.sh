@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.6.1"
+SCRIPT_VERSION="3.8.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -43,6 +43,7 @@ SITE_MODE="none"     # none | local | redirect
 SITE_TARGET=""       # redirect destination domain (no scheme)
 SITE_DOMAIN=""       # domain the TLS cert belongs to (site's SNI on 443)
 SITE_BIND_PORT=""    # actual free loopback port the site listens on
+PANEL_ON_SITE="no"   # serve the panel under the site domain at its base path
 SITE_CERT=""         # fullchain path
 SITE_KEY=""          # private key path
 
@@ -510,6 +511,20 @@ set_setting() {
 }
 
 panel_port() { local p; p=$(get_setting webPort); [ -n "$p" ] || p="$DEFAULT_PANEL_PORT"; printf '%s\n' "$p"; }
+# x-ui's base path, e.g. "/xpanel/". Normalised to /xxx (no trailing slash);
+# empty when the panel sits at the web root.
+panel_path() {
+  local v; v=$(get_setting webBasePath)
+  v="${v%/}"
+  [ -n "$v" ] && [ "${v#/}" = "$v" ] && v="/$v"
+  printf '%s\n' "$v"
+}
+sub_path() {
+  local v; v=$(get_setting subPath)
+  v="${v%/}"
+  [ -n "$v" ] && [ "${v#/}" = "$v" ] && v="/$v"
+  printf '%s\n' "$v"
+}
 sub_port()   { local p; p=$(get_setting subPort); [ -n "$p" ] || p="$DEFAULT_SUB_PORT"; printf '%s\n' "$p"; }
 panel_tls()  { [ -n "$(get_setting webCertFile)" ] && return 0 || return 1; }
 sub_tls()    { [ -n "$(get_setting subCertFile)" ] && return 0 || return 1; }
@@ -625,6 +640,7 @@ load_state() {
   SITE_CERT=$(jq -r '.site_cert // ""' "$STATE_FILE")
   SITE_KEY=$(jq -r '.site_key // ""' "$STATE_FILE")
   SITE_BIND_PORT=$(jq -r '.site_bind_port // ""' "$STATE_FILE")
+  PANEL_ON_SITE=$(jq -r '.panel_on_site // "no"' "$STATE_FILE")
   [ -n "$SITE_BIND_PORT" ] && SITE_PORT="$SITE_BIND_PORT"
 }
 
@@ -634,10 +650,10 @@ save_state() {
         --arg pr "$PANEL_ROUTE" --arg sr "$SUB_ROUTE" \
         --arg sm "$SITE_MODE" --arg st "$SITE_TARGET" \
         --arg sd "$SITE_DOMAIN" --arg sc "$SITE_CERT" --arg sk "$SITE_KEY" \
-        --arg sbp "$SITE_PORT" \
+        --arg sbp "$SITE_PORT" --arg pos "$PANEL_ON_SITE" \
     '{public_host:$ph, panel_host:$pa, sub_host:$su, panel_route:$pr, sub_route:$sr,
       site_mode:$sm, site_target:$st, site_domain:$sd, site_cert:$sc, site_key:$sk,
-      site_bind_port:$sbp}' > "$STATE_FILE"
+      site_bind_port:$sbp, panel_on_site:$pos}' > "$STATE_FILE"
 }
 
 save_original_ports() {
@@ -1397,6 +1413,18 @@ do_setup() {
     2) site_ask_redirect || site_choice=3 ;;
   esac
 
+  # Offer to publish the panel under the site's domain at its own base path,
+  # e.g. https://site.example.com/xpanel - one domain for both.
+  PANEL_ON_SITE="no"
+  if [ "$site_choice" != "3" ] && [ -n "$SITE_DOMAIN" ]; then
+    local ppath; ppath=$(panel_path)
+    if [ -n "$ppath" ]; then
+      PANEL_ON_SITE=$(ask "Also serve the panel at https://${SITE_DOMAIN}${ppath} ? [y/N]" v_yn "$PANEL_ON_SITE")
+    else
+      warn "The panel has no base path set (webBasePath) - set one in the panel to publish it under the site domain."
+    fi
+  fi
+
   local fw_choice
   fw_choice=$(ask "Install and enable the firewall (ufw)? [y/N]" v_yn "no")
 
@@ -1431,6 +1459,9 @@ do_setup() {
     *) printf '  Site                     none\n' ;;
   esac
   [ -n "$SITE_DOMAIN" ] && printf '  Site certificate         %s\n' "$SITE_DOMAIN"
+  if [ "$PANEL_ON_SITE" = "yes" ]; then
+    printf '  Panel URL                https://%s%s/\n' "$SITE_DOMAIN" "$(panel_path)"
+  fi
   printf '  Firewall (ufw)           %s\n' "$fw_choice"
   echo
   warn "Existing users will be disconnected until they get updated links."
@@ -2008,8 +2039,46 @@ write_site_conf() {
       echo "    ssl_certificate_key ${SITE_KEY};"
       echo "    ssl_protocols TLSv1.2 TLSv1.3;"
       echo "    ssl_session_cache shared:R443SSL:10m;"
+      # This server listens on a private loopback port behind the 443 stream
+      # router. Without these, nginx builds redirects and proxied Location
+      # headers from its own port and leaks e.g. https://host:8081/ to clients.
+      echo "    port_in_redirect off;"
+      echo "    absolute_redirect off;"
+      # Panel / subscription served on the SAME domain under their own base
+      # paths. These must come before the catch-all "location /" so that
+      # https://<site>/xpanel reaches x-ui instead of the static site.
+      if [ "$PANEL_ON_SITE" = "yes" ]; then
+        local ppath pport spath sport2
+        ppath=$(panel_path); pport=$(panel_port)
+        if [ -n "$ppath" ]; then
+          echo "    location ${ppath}/ {"
+          echo "        proxy_pass http://127.0.0.1:${pport};"
+          echo "        proxy_http_version 1.1;"
+          echo "        proxy_set_header Host \$host;"
+          echo "        proxy_set_header X-Real-IP \$remote_addr;"
+          echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+          echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+          echo "        proxy_set_header Upgrade \$http_upgrade;"
+          echo "        proxy_set_header Connection \"upgrade\";"
+          echo "        proxy_read_timeout 300s;"
+          echo "        proxy_redirect ~^http://[^/]+(/.*)\$ https://\$host\$1;"
+          echo "    }"
+          # /xpanel with no trailing slash must not fall through to the site
+          echo "    location = ${ppath} { return 301 ${ppath}/; }"
+        fi
+        spath=$(sub_path); sport2=$(sub_port)
+        if [ -n "$spath" ] && [ "$spath" != "$ppath" ]; then
+          echo "    location ${spath}/ {"
+          echo "        proxy_pass http://127.0.0.1:${sport2};"
+          echo "        proxy_http_version 1.1;"
+          echo "        proxy_set_header Host \$host;"
+          echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+          echo "    }"
+          echo "    location = ${spath} { return 301 ${spath}/; }"
+        fi
+      fi
       if [ "$SITE_MODE" = "redirect" ]; then
-        echo "    return 301 https://${SITE_TARGET}\$request_uri;"
+        echo "    location / { return 301 https://${SITE_TARGET}\$request_uri; }"
       else
         echo "    root ${SITE_ROOT};"
         echo "    index index.html index.htm;"
@@ -2057,8 +2126,31 @@ disable_stock_default_site() {
   done
 }
 
+# When the panel is proxied by nginx, nginx terminates TLS - x-ui itself must
+# then answer plain HTTP on its loopback port, or the proxy_pass gets a TLS
+# handshake it cannot parse and the panel 502s.
+check_panel_backend_plain() {
+  [ "$PANEL_ON_SITE" = "yes" ] || return 0
+  local cert; cert=$(get_setting webCertFile)
+  [ -n "$cert" ] || return 0
+  warn "The panel has its own TLS certificate configured (webCertFile)."
+  warn "nginx already terminates TLS for it, so the panel must serve plain HTTP."
+  local c; c=$(ask "Clear the panel's certificate settings so the proxy works? [y/N]" v_yn "yes")
+  if [ "$c" = "yes" ]; then
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+    set_setting webCertFile ""
+    set_setting webKeyFile ""
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+    ok "Panel TLS cleared - it now serves plain HTTP behind nginx."
+  else
+    warn "Leaving it as is; https://${SITE_DOMAIN}$(panel_path) may return 502."
+  fi
+  return 0
+}
+
 apply_site() {
   disable_stock_default_site
+  check_panel_backend_plain
   if [ -n "$SITE_DOMAIN" ]; then
     pick_site_port || return 1
     SITE_BIND_PORT="$SITE_PORT"
@@ -2073,6 +2165,9 @@ apply_site() {
     systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null || true
     if [ -n "$SITE_DOMAIN" ]; then
       ok "Site is live on https://${SITE_DOMAIN} (and http:// redirects to it)."
+      if [ "$PANEL_ON_SITE" = "yes" ]; then
+        ok "Panel is live on https://${SITE_DOMAIN}$(panel_path)/"
+      fi
     else
       ok "Site is live on port 80."
     fi
@@ -2180,6 +2275,27 @@ site_disable() {
   fi
 }
 
+toggle_panel_on_site() {
+  if [ "$SITE_MODE" = "none" ] || [ -z "$SITE_DOMAIN" ]; then
+    err "Set up the site with a certificate first."
+    return 1
+  fi
+  local ppath; ppath=$(panel_path)
+  if [ -z "$ppath" ]; then
+    err "The panel has no base path (webBasePath) set."
+    err "Set one in the panel (e.g. /xpanel), then come back."
+    return 1
+  fi
+  PANEL_ON_SITE=$(ask "Serve the panel at https://${SITE_DOMAIN}${ppath} ? [y/N]" v_yn "$PANEL_ON_SITE")
+  save_state
+  apply_site || return 1
+  if [ "$PANEL_ON_SITE" = "yes" ]; then
+    ok "Panel URL: https://${SITE_DOMAIN}${ppath}/"
+  else
+    ok "Panel is no longer served under the site domain."
+  fi
+}
+
 site_menu() {
   while true; do
     header
@@ -2188,12 +2304,16 @@ site_menu() {
     [ -n "$SITE_DOMAIN" ] && printf '%sDomain      %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_DOMAIN" "$R"
     [ "$SITE_MODE" = "redirect" ] && printf '%sRedirects   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_TARGET" "$R"
     [ "$SITE_MODE" = "local" ] && printf '%sFiles       %s%s%s\n' "$C_GRAY" "$C_WHITE" "$SITE_ROOT" "$R"
+    if [ "$PANEL_ON_SITE" = "yes" ] && [ -n "$SITE_DOMAIN" ]; then
+      printf '%sPanel URL   %shttps://%s%s/%s\n' "$C_GRAY" "$C_WHITE" "$SITE_DOMAIN" "$(panel_path)" "$R"
+    fi
     echo
     line_c 0 "1) Serve Local Files"
     line_c 1 "2) Redirect to Another Site"
     line_c 2 "3) Change Certificate"
-    line_c 3 "4) Disable Site"
-    line_c 4 "0) Back"
+    line_c 3 "4) Panel on Site Domain"
+    line_c 4 "5) Disable Site"
+    line_c 5 "0) Back"
     local ch
     printf '%sChoice%s: ' "$(next_c)" "$R"
     IFS= read -r ch || ch=0
@@ -2202,11 +2322,15 @@ site_menu() {
       2) site_ask_redirect && site_apply_redirect; pause ;;
       3) if choose_cert; then
            save_state
-           [ "$SITE_MODE" = "none" ] && warn "No site configured yet - set one up first."
-           [ "$SITE_MODE" != "none" ] && apply_site
+           if [ "$SITE_MODE" = "none" ]; then
+             warn "No site configured yet - set one up first."
+           else
+             apply_site
+           fi
          fi
          pause ;;
-      4) site_disable; pause ;;
+      4) toggle_panel_on_site; pause ;;
+      5) site_disable; pause ;;
       0) return 0 ;;
       *) err "Pick a number from the list."; pause ;;
     esac
@@ -2235,6 +2359,19 @@ ssh_ports() {
   } 2>/dev/null | grep -E '^[0-9]+$' 2>/dev/null | sort -un || true
 }
 
+# Adds one ufw rule and REPORTS THE TRUTH. Every rule used to be wrapped in
+# ">/dev/null 2>&1 || true", so a rule that silently failed still printed OK -
+# which is how you end up locked out of a panel the script claims it opened.
+fw_allow() {
+  local port="$1" label="$2" out
+  if out=$(ufw allow "${port}/tcp" 2>&1); then
+    ok "Allowed ${port}/tcp${label:+  (${label})}"
+    return 0
+  fi
+  err "Failed to allow ${port}/tcp${label:+ (${label})}: ${out}"
+  return 1
+}
+
 setup_firewall() {
   local -a detected=()
   mapfile -t detected < <(ssh_ports)
@@ -2257,8 +2394,24 @@ setup_firewall() {
   local -a sports=()
   read -ra sports <<< "$answer"
 
+  # Show exactly what will be opened BEFORE touching anything.
+  local pp sbp
+  pp=$(panel_port); sbp=$(sub_port)
+  echo
+  printf '%sPorts that will be opened%s\n' "$C_PURPLE" "$R"
+  for sp in "${sports[@]}"; do printf '  %-7s %s\n' "$sp" "SSH"; done
+  printf '  %-7s %s\n' "80" "http"
+  printf '  %-7s %s\n' "443" "https / proxy"
+  printf '  %-7s %s\n' "$pp" "x-ui panel"
+  printf '  %-7s %s\n' "$sbp" "subscription"
+  echo
   local extra
   extra=$(ask "Extra ports to open (space separated, blank for none)" v_port_list "")
+  local go; go=$(ask "Enable the firewall with these rules? [y/N]" v_yn "no")
+  if [ "$go" != "yes" ]; then
+    warn "Firewall not changed."
+    return 0
+  fi
 
   if ! have ufw; then
     info "Installing ufw..."
@@ -2269,43 +2422,102 @@ setup_firewall() {
     return 1
   fi
 
+  local failed=0
   # SSH first, always - enabling ufw without it would lock this session out.
   for sp in "${sports[@]}"; do
-    ufw allow "${sp}/tcp" >/dev/null 2>&1 || true
-    ok "Allowed SSH port ${sp}/tcp"
+    fw_allow "$sp" "SSH" || failed=$((failed + 1))
   done
-
-  ufw allow 80/tcp  >/dev/null 2>&1 || true
-  ok "Allowed 80/tcp"
-  ufw allow 443/tcp >/dev/null 2>&1 || true
-  ok "Allowed 443/tcp"
-
-  if [ "$PANEL_ROUTE" != "yes" ]; then
-    local pp; pp=$(panel_port)
-    ufw allow "${pp}/tcp" >/dev/null 2>&1 || true
-    ok "Allowed panel port ${pp}/tcp"
+  if [ "$failed" -gt 0 ]; then
+    err "Could not open the SSH port(s). Refusing to enable the firewall."
+    return 1
   fi
-  if [ "$SUB_ROUTE" != "yes" ]; then
-    local sbp; sbp=$(sub_port)
-    ufw allow "${sbp}/tcp" >/dev/null 2>&1 || true
-    ok "Allowed subscription port ${sbp}/tcp"
-  fi
+
+  fw_allow 80  "http"  || failed=$((failed + 1))
+  fw_allow 443 "https" || failed=$((failed + 1))
+  # The panel and subscription ports stay open even when they are also reachable
+  # through 443: closing them is what makes the panel vanish from the browser
+  # for anyone who opens it by IP:port.
+  fw_allow "$pp"  "x-ui panel"   || failed=$((failed + 1))
+  fw_allow "$sbp" "subscription" || failed=$((failed + 1))
 
   local e
   for e in $extra; do
-    ufw allow "${e}/tcp" >/dev/null 2>&1 || true
-    ok "Allowed ${e}/tcp"
+    fw_allow "$e" "extra" || failed=$((failed + 1))
   done
 
-  ufw --force enable >/dev/null 2>&1 || true
-  echo
-  if ufw status 2>/dev/null | grep -qi '^Status: active'; then
-    ok "Firewall is active."
-  else
-    warn "ufw did not report active - check 'ufw status'."
+  if [ "$failed" -gt 0 ]; then
+    err "${failed} rule(s) failed - not enabling the firewall to avoid locking you out."
+    return 1
   fi
-  ufw status 2>/dev/null | sed -n '1,20p'
+
+  if ! ufw --force enable >/tmp/r443.ufw.err 2>&1; then
+    err "Could not enable ufw:"
+    sed -n '1,10p' /tmp/r443.ufw.err >&2
+    return 1
+  fi
+
+  echo
+  if ! ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    warn "ufw did not report active - check 'ufw status'."
+    return 1
+  fi
+  ok "Firewall is active."
+
+  # Verify the rules that matter actually landed, rather than trusting the
+  # earlier output.
+  local not_open="" check
+  for check in "${sports[@]}" 80 443 "$pp" "$sbp"; do
+    ufw status 2>/dev/null | grep -qE "^${check}/tcp" || not_open="${not_open} ${check}"
+  done
+  if [ -n "$not_open" ]; then
+    err "These ports are NOT open despite the rules:${not_open}"
+    err "Run 'ufw disable' if you lose access, then re-run this step."
+  else
+    ok "Verified: SSH, 80, 443, panel (${pp}) and subscription (${sbp}) are open."
+  fi
+  echo
+  ufw status 2>/dev/null | sed -n '1,25p'
   return 0
+}
+
+# Turns the firewall off - the escape hatch when a rule locks something out.
+disable_firewall() {
+  if ! have ufw; then
+    warn "ufw is not installed."
+    return 0
+  fi
+  local c; c=$(ask "Disable the firewall? [y/N]" v_yn "no")
+  [ "$c" = "yes" ] || { warn "Cancelled."; return 0; }
+  if ufw disable >/dev/null 2>&1; then
+    ok "Firewall disabled."
+  else
+    err "Could not disable ufw."
+  fi
+}
+
+firewall_menu() {
+  while true; do
+    header
+    if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+      printf '%sStatus  %sactive%s\n\n' "$C_GRAY" "$C_WHITE" "$R"
+    else
+      printf '%sStatus  %sinactive%s\n\n' "$C_GRAY" "$C_WHITE" "$R"
+    fi
+    line_c 0 "1) Enable Firewall"
+    line_c 1 "2) Disable Firewall"
+    line_c 2 "3) Show Rules"
+    line_c 3 "0) Back"
+    local ch
+    printf '%sChoice%s: ' "$(next_c)" "$R"
+    IFS= read -r ch || ch=0
+    case "$ch" in
+      1) setup_firewall; pause ;;
+      2) disable_firewall; pause ;;
+      3) if have ufw; then ufw status verbose 2>/dev/null | sed -n '1,30p'; else warn "ufw is not installed."; fi; pause ;;
+      0) return 0 ;;
+      *) err "Pick a number from the list."; pause ;;
+    esac
+  done
 }
 
 main_menu() {
@@ -2329,7 +2541,7 @@ main_menu() {
       1) do_setup ;;
       2) do_sync ;;
       3) site_menu ;;
-      4) header; setup_firewall; pause ;;
+      4) firewall_menu ;;
       5) manage_hosts ;;
       6) panel_menu ;;
       7) services_menu ;;
