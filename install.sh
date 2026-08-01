@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.8.0"
+SCRIPT_VERSION="3.8.2"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -738,6 +738,14 @@ v_site_choice() {
   return 1
 }
 
+# Same as v_yn but a bare Enter means YES.
+v_yn_default_yes() {
+  local x; x=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$x" in y|yes|"") echo yes; return 0 ;; n|no) echo no; return 0 ;; esac
+  err "Answer y or n."
+  return 1
+}
+
 v_yn() {
   local x; x=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
   case "$x" in y|yes) echo yes; return 0 ;; n|no|"") echo no; return 0 ;; esac
@@ -1172,6 +1180,18 @@ diagnose() {
   printf '  Panel port       %s (via 443: %s %s)\n' "$(panel_port)" "$PANEL_ROUTE" "$PANEL_HOST"
   printf '  Sub port         %s (via 443: %s %s)\n' "$(sub_port)" "$SUB_ROUTE" "$SUB_HOST"
   printf '  Stream file      %s\n' "$([ -f "$STREAM_FILE" ] && echo present || echo MISSING)"
+  if [ -n "$SITE_DOMAIN" ]; then
+    local dp; dp=$(panel_path)
+    printf '  Site domain      https://%s\n' "$SITE_DOMAIN"
+    if [ -n "$dp" ]; then
+      if grep -qF "location ${dp}/" "$SITE_CONF" 2>/dev/null; then
+        printf '  Panel URL        https://%s%s/  (routed)\n' "$SITE_DOMAIN" "$dp"
+      else
+        printf '  Panel URL        %sNOT routed - https://%s%s shows the SITE%s\n' "$C_ERR" "$SITE_DOMAIN" "$dp" "$R"
+        printf '                   %sFix: Camouflage Site > Panel on Site Domain%s\n' "$C_GRAY" "$R"
+      fi
+    fi
+  fi
   printf '  Hooked into conf %s\n' "$(grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null && echo yes || echo NO)"
   echo
 
@@ -1419,9 +1439,13 @@ do_setup() {
   if [ "$site_choice" != "3" ] && [ -n "$SITE_DOMAIN" ]; then
     local ppath; ppath=$(panel_path)
     if [ -n "$ppath" ]; then
-      PANEL_ON_SITE=$(ask "Also serve the panel at https://${SITE_DOMAIN}${ppath} ? [y/N]" v_yn "$PANEL_ON_SITE")
+      warn "The site will occupy ${SITE_DOMAIN}. Without this, ${SITE_DOMAIN}${ppath} shows the site, not the panel."
+      # Default yes: putting a site on the panel's domain and NOT publishing the
+      # panel is how the panel silently disappears behind index.html.
+      PANEL_ON_SITE=$(ask "Serve the panel at https://${SITE_DOMAIN}${ppath} ? [Y/n]" v_yn_default_yes "yes")
     else
-      warn "The panel has no base path set (webBasePath) - set one in the panel to publish it under the site domain."
+      warn "The panel has no base path set (webBasePath)."
+      warn "Set one in the panel (e.g. /xpanel) so it can be published under the site domain."
     fi
   fi
 
@@ -2166,7 +2190,16 @@ apply_site() {
     if [ -n "$SITE_DOMAIN" ]; then
       ok "Site is live on https://${SITE_DOMAIN} (and http:// redirects to it)."
       if [ "$PANEL_ON_SITE" = "yes" ]; then
-        ok "Panel is live on https://${SITE_DOMAIN}$(panel_path)/"
+        local ppath2; ppath2=$(panel_path)
+        if grep -qF "location ${ppath2}/" "$SITE_CONF" 2>/dev/null; then
+          ok "Panel is live on https://${SITE_DOMAIN}${ppath2}/"
+        else
+          err "The panel location block is MISSING from ${SITE_CONF}."
+          err "https://${SITE_DOMAIN}${ppath2} will show the site instead of the panel."
+        fi
+      else
+        local ppath3; ppath3=$(panel_path)
+        [ -n "$ppath3" ] && warn "The panel is NOT published on this domain - https://${SITE_DOMAIN}${ppath3} shows the site. Enable it from: Camouflage Site > Panel on Site Domain."
       fi
     else
       ok "Site is live on port 80."
@@ -2363,12 +2396,12 @@ ssh_ports() {
 # ">/dev/null 2>&1 || true", so a rule that silently failed still printed OK -
 # which is how you end up locked out of a panel the script claims it opened.
 fw_allow() {
-  local port="$1" label="$2" out
-  if out=$(ufw allow "${port}/tcp" 2>&1); then
-    ok "Allowed ${port}/tcp${label:+  (${label})}"
+  local port="$1" label="$2" proto="${3:-tcp}" out
+  if out=$(ufw allow "${port}/${proto}" 2>&1); then
+    ok "Allowed ${port}/${proto}${label:+  (${label})}"
     return 0
   fi
-  err "Failed to allow ${port}/tcp${label:+ (${label})}: ${out}"
+  err "Failed to allow ${port}/${proto}${label:+ (${label})}: ${out}"
   return 1
 }
 
@@ -2401,7 +2434,8 @@ setup_firewall() {
   printf '%sPorts that will be opened%s\n' "$C_PURPLE" "$R"
   for sp in "${sports[@]}"; do printf '  %-7s %s\n' "$sp" "SSH"; done
   printf '  %-7s %s\n' "80" "http"
-  printf '  %-7s %s\n' "443" "https / proxy"
+  printf '  %-7s %s\n' "443/tcp" "https / proxy"
+  printf '  %-7s %s\n' "443/udp" "QUIC / Hysteria2 / TUIC"
   printf '  %-7s %s\n' "$pp" "x-ui panel"
   printf '  %-7s %s\n' "$sbp" "subscription"
   echo
@@ -2433,7 +2467,10 @@ setup_firewall() {
   fi
 
   fw_allow 80  "http"  || failed=$((failed + 1))
-  fw_allow 443 "https" || failed=$((failed + 1))
+  fw_allow 443 "https / proxy" || failed=$((failed + 1))
+  # UDP 443 carries QUIC, Hysteria2 and TUIC. Leaving it closed silently kills
+  # those protocols while TCP-based ones keep working, which is hard to spot.
+  fw_allow 443 "QUIC / Hysteria2 / TUIC" udp || failed=$((failed + 1))
   # The panel and subscription ports stay open even when they are also reachable
   # through 443: closing them is what makes the panel vanish from the browser
   # for anyone who opens it by IP:port.
@@ -2443,6 +2480,7 @@ setup_firewall() {
   local e
   for e in $extra; do
     fw_allow "$e" "extra" || failed=$((failed + 1))
+    fw_allow "$e" "extra" udp || failed=$((failed + 1))
   done
 
   if [ "$failed" -gt 0 ]; then
@@ -2467,13 +2505,14 @@ setup_firewall() {
   # earlier output.
   local not_open="" check
   for check in "${sports[@]}" 80 443 "$pp" "$sbp"; do
-    ufw status 2>/dev/null | grep -qE "^${check}/tcp" || not_open="${not_open} ${check}"
+    ufw status 2>/dev/null | grep -qE "^${check}/tcp" || not_open="${not_open} ${check}/tcp"
   done
+  ufw status 2>/dev/null | grep -qE '^443/udp' || not_open="${not_open} 443/udp"
   if [ -n "$not_open" ]; then
     err "These ports are NOT open despite the rules:${not_open}"
     err "Run 'ufw disable' if you lose access, then re-run this step."
   else
-    ok "Verified: SSH, 80, 443, panel (${pp}) and subscription (${sbp}) are open."
+    ok "Verified: SSH, 80, 443/tcp, 443/udp, panel (${pp}) and subscription (${sbp}) are open."
   fi
   echo
   ufw status 2>/dev/null | sed -n '1,25p'
