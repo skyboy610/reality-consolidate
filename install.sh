@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.8.2"
+SCRIPT_VERSION="3.9.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -935,12 +935,19 @@ write_stream_conf() {
     echo "}"
     echo ""
     echo "server {"
-    echo "    listen 443 reuseport;"
-    has_ipv6 && echo "    listen [::]:443 reuseport;"
+    echo "    listen 443 reuseport backlog=4096;"
+    has_ipv6 && echo "    listen [::]:443 reuseport backlog=4096;"
     echo "    proxy_pass \$reality443;"
     echo "    ssl_preread on;"
     echo "    proxy_timeout 1h;"
     echo "    proxy_connect_timeout 5s;"
+    # Default stream proxy_buffer_size is 16k, which throttles bulk transfers
+    # through the router. 64k is the sweet spot for proxied TLS streams.
+    echo "    proxy_buffer_size 64k;"
+    # Keep the connection to the backend alive on half-closes so a client that
+    # stops sending does not tear down an active download.
+    echo "    proxy_socket_keepalive on;"
+    echo "    tcp_nodelay on;"
     echo "}"
   } > "$tmp"
   mkdir -p "$(dirname "$STREAM_FILE")" 2>/dev/null || true
