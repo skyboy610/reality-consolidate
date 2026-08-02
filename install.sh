@@ -3,7 +3,7 @@
 # port 443 using nginx stream + ssl_preread (SNI routing, no TLS termination).
 set -euo pipefail
 
-SCRIPT_VERSION="3.9.0"
+SCRIPT_VERSION="4.0.0"
 
 # ---------------------------------------------------------------------------
 # Paths / services
@@ -2082,8 +2082,15 @@ write_site_conf() {
         local ppath pport spath sport2
         ppath=$(panel_path); pport=$(panel_port)
         if [ -n "$ppath" ]; then
+          local pscheme; pscheme=$(panel_backend_scheme)
           echo "    location ${ppath}/ {"
-          echo "        proxy_pass http://127.0.0.1:${pport};"
+          echo "        proxy_pass ${pscheme}://127.0.0.1:${pport};"
+          if [ "$pscheme" = "https" ]; then
+            # the panel presents its own certificate on loopback; we are not
+            # validating a name we control, so skip verification
+            echo "        proxy_ssl_verify off;"
+            echo "        proxy_ssl_server_name on;"
+          fi
           echo "        proxy_http_version 1.1;"
           echo "        proxy_set_header Host \$host;"
           echo "        proxy_set_header X-Real-IP \$remote_addr;"
@@ -2099,8 +2106,14 @@ write_site_conf() {
         fi
         spath=$(sub_path); sport2=$(sub_port)
         if [ -n "$spath" ] && [ "$spath" != "$ppath" ]; then
+          local sscheme="http"
+          [ -n "$(get_setting subCertFile)" ] && sscheme="https"
           echo "    location ${spath}/ {"
-          echo "        proxy_pass http://127.0.0.1:${sport2};"
+          echo "        proxy_pass ${sscheme}://127.0.0.1:${sport2};"
+          if [ "$sscheme" = "https" ]; then
+            echo "        proxy_ssl_verify off;"
+            echo "        proxy_ssl_server_name on;"
+          fi
           echo "        proxy_http_version 1.1;"
           echo "        proxy_set_header Host \$host;"
           echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
@@ -2160,28 +2173,16 @@ disable_stock_default_site() {
 # When the panel is proxied by nginx, nginx terminates TLS - x-ui itself must
 # then answer plain HTTP on its loopback port, or the proxy_pass gets a TLS
 # handshake it cannot parse and the panel 502s.
-check_panel_backend_plain() {
-  [ "$PANEL_ON_SITE" = "yes" ] || return 0
+# Whether the panel serves HTTPS on its own port. When it does, nginx must
+# proxy with https:// upstream; when it does not, http://. Detected instead of
+# asked, and x-ui's own settings are never modified.
+panel_backend_scheme() {
   local cert; cert=$(get_setting webCertFile)
-  [ -n "$cert" ] || return 0
-  warn "The panel has its own TLS certificate configured (webCertFile)."
-  warn "nginx already terminates TLS for it, so the panel must serve plain HTTP."
-  local c; c=$(ask "Clear the panel's certificate settings so the proxy works? [y/N]" v_yn "yes")
-  if [ "$c" = "yes" ]; then
-    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-    set_setting webCertFile ""
-    set_setting webKeyFile ""
-    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-    ok "Panel TLS cleared - it now serves plain HTTP behind nginx."
-  else
-    warn "Leaving it as is; https://${SITE_DOMAIN}$(panel_path) may return 502."
-  fi
-  return 0
+  if [ -n "$cert" ]; then printf 'https\n'; else printf 'http\n'; fi
 }
 
 apply_site() {
   disable_stock_default_site
-  check_panel_backend_plain
   if [ -n "$SITE_DOMAIN" ]; then
     pick_site_port || return 1
     SITE_BIND_PORT="$SITE_PORT"
