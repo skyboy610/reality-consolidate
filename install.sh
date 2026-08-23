@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="5.3.0"
+SCRIPT_VERSION="5.4.0"
 SELF_SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${0:-}")"
 
 DB_PATH="${DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -29,7 +29,7 @@ SITE_CONF="/etc/nginx/conf.d/reality443-site.conf"
 SITE_ROOT="/var/www/reality443"
 SITE_PORT=8081
 
-CERT_SEARCH_DIRS="/root/cert /etc/letsencrypt/live /root/.acme.sh /etc/ssl/private /opt/cert /usr/local/etc/xray"
+CERT_SEARCH_DIRS="/root /root/cert /root/certs /root/.acme.sh /etc/letsencrypt/live /etc/ssl/private /etc/ssl/certs /etc/nginx/ssl /etc/nginx/cert /etc/x-ui /opt/cert /opt/certs /usr/local/etc/xray /home"
 XUI_SERVICE="x-ui"
 NGINX_SERVICE="nginx"
 
@@ -362,11 +362,11 @@ configure_subscription() {
     [ -n "$SUB_DOMAIN" ] || SUB_DOMAIN="$DOMAIN"
     if [ "$SUB_DOMAIN" != "$DOMAIN" ]; then
         SUB_CERT=""; SUB_KEY=""
-        if auto_select_cert_into "$SUB_DOMAIN" SUB_CERT SUB_KEY; then
-            ok "Certificate matched for ${SUB_DOMAIN}"
+        if resolve_cert "$SUB_DOMAIN" SUB_CERT SUB_KEY; then
+            cert_expired "$SUB_CERT" && warn "Certificate for ${SUB_DOMAIN} is EXPIRED - renew it"
             pick_sub_port || { SUB_DOMAIN="$DOMAIN"; SUB_CERT=""; SUB_KEY=""; }
         else
-            err "No certificate covering ${SUB_DOMAIN} - falling back to ${DOMAIN}"
+            warn "No certificate for ${SUB_DOMAIN} - subscription falls back to ${DOMAIN}"
             SUB_DOMAIN="$DOMAIN"; SUB_CERT=""; SUB_KEY=""; SUB_BIND_PORT=""
         fi
     fi
@@ -1184,30 +1184,89 @@ set_inbound_host() {
     fi
 }
 
+is_cert_file() {
+    openssl x509 -in "$1" -noout -subject >/dev/null 2>&1
+}
+
+is_key_file() {
+    openssl pkey -in "$1" -noout >/dev/null 2>&1
+}
+
+key_matches_cert() {
+    local c="$1" k="$2" cp kp
+    cp=$(openssl x509 -in "$c" -pubkey -noout 2>/dev/null)
+    [ -n "$cp" ] || return 1
+    kp=$(openssl pkey -in "$k" -pubout 2>/dev/null)
+    [ -n "$kp" ] || return 1
+    [ "$cp" = "$kp" ]
+}
+
+cert_primary_name() {
+    local c="$1" n
+    n=$(openssl x509 -in "$c" -noout -text 2>/dev/null | grep -oE 'DNS:[^,]+' | head -n1 | sed 's/DNS://; s/ //g')
+    [ -n "$n" ] || n=$(openssl x509 -in "$c" -noout -subject 2>/dev/null | grep -oE 'CN[[:space:]]*=[[:space:]]*[^,/]+' | sed 's/.*=[[:space:]]*//; s/[[:space:]]*$//')
+    printf '%s' "$n"
+}
+
+cert_expired() {
+    openssl x509 -in "$1" -noout -checkend 0 >/dev/null 2>&1 && return 1
+    return 0
+}
+
+search_depth_for() {
+    case "$1" in
+        /root|/home|/etc/ssl/certs) printf '1' ;;
+        /etc/letsencrypt/live) printf '2' ;;
+        *) printf '3' ;;
+    esac
+}
+
+find_key_for_cert() {
+    local c="$1" d k base
+    d=$(dirname "$c")
+    base=$(basename "$c")
+    base="${base%.*}"
+    for k in "${d}/${base}.key" "${d}/${base}.pem" "${d}/privkey.pem" "${d}/private.key" \
+             "${d}/key.key" "${d}/key.pem" "${d}/privkey.key" "${d}/$(basename "$d").key" \
+             "${d}/server.key" "${d}/ssl.key"; do
+        [ -f "$k" ] || continue
+        is_key_file "$k" || continue
+        key_matches_cert "$c" "$k" && { printf '%s' "$k"; return 0; }
+    done
+    while IFS= read -r k; do
+        [ -f "$k" ] || continue
+        [ "$k" = "$c" ] && continue
+        is_key_file "$k" || continue
+        key_matches_cert "$c" "$k" && { printf '%s' "$k"; return 0; }
+    done < <(find "$d" -maxdepth 1 -type f \( -name '*.key' -o -name '*.pem' -o -name '*.txt' \) 2>/dev/null | head -40)
+    return 1
+}
+
 find_cert_pairs() {
-    local base d chain key dom k
+    local base depth f key dom
     for base in $CERT_SEARCH_DIRS; do
         [ -d "$base" ] || continue
-        while IFS= read -r chain; do
-            [ -f "$chain" ] || continue
-            d=$(dirname "$chain")
-            key=""
-            for k in privkey.pem private.key key.pem privkey.key "$(basename "$d").key"; do
-                [ -f "${d}/${k}" ] && { key="${d}/${k}"; break; }
-            done
-            [ -n "$key" ] || key=$(find "$d" -maxdepth 1 -name '*.key' -type f 2>/dev/null | head -n1)
+        depth=$(search_depth_for "$base")
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            [ -s "$f" ] || continue
+            is_cert_file "$f" || continue
+            key=$(find_key_for_cert "$f") || continue
             [ -n "$key" ] || continue
-            dom=$(basename "$d")
-            printf '%s|%s|%s\n' "$dom" "$chain" "$key"
-        done < <(find "$base" -maxdepth 3 \( -name 'fullchain.pem' -o -name 'fullchain.cer' -o -name 'cert.pem' -o -name 'cert.crt' \) -type f 2>/dev/null)
+            dom=$(cert_primary_name "$f")
+            [ -n "$dom" ] || dom=$(basename "$(dirname "$f")")
+            printf '%s|%s|%s\n' "$dom" "$f" "$key"
+        done < <(find "$base" -maxdepth "$depth" -type f \( -name '*.pem' -o -name '*.crt' -o -name '*.cer' -o -name '*.fullchain' \) 2>/dev/null | head -80)
     done | awk -F'|' '!seen[$2]++'
 }
 
 cert_covers_domain() {
-    local crt="$1" dom="$2" names
+    local crt="$1" dom="$2" names n cn
     names=$(openssl x509 -in "$crt" -noout -text 2>/dev/null | grep -oE 'DNS:[^,]+' | sed 's/DNS://g' | tr -d ' ' || true)
+    cn=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null | grep -oE 'CN[[:space:]]*=[[:space:]]*[^,/]+' | sed 's/.*=[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$cn" ] && names="${names}
+${cn}"
     [ -n "$names" ] || return 1
-    local n
     for n in $names; do
         [ "$n" = "$dom" ] && return 0
         case "$n" in
@@ -1243,6 +1302,81 @@ auto_select_cert_into() {
 
 auto_select_cert() {
     auto_select_cert_into "$1" SITE_CERT SITE_KEY
+}
+
+list_found_certs() {
+    local -a pairs=()
+    mapfile -t pairs < <(find_cert_pairs)
+    if [ "${#pairs[@]}" -eq 0 ]; then
+        warn "No usable certificate/key pair found under: ${CERT_SEARCH_DIRS}"
+        return 1
+    fi
+    local k pd pc
+    step "Certificates found on this server"
+    for k in "${!pairs[@]}"; do
+        pd=$(printf '%s' "${pairs[$k]}" | cut -d'|' -f1)
+        pc=$(printf '%s' "${pairs[$k]}" | cut -d'|' -f2)
+        line_c "$k" "  $((k + 1))) ${pd}"
+        printf '%s        %s%s\n' "$C_SLATE" "$pc" "$R"
+    done
+    return 0
+}
+
+resolve_cert() {
+    local dom="$1" cvar="$2" kvar="$3" pick c1 c2
+    local -a pairs=()
+    if auto_select_cert_into "$dom" "$cvar" "$kvar"; then
+        ok "Certificate matched for ${dom}"
+        return 0
+    fi
+    err "No certificate covering ${dom} was auto-detected"
+    mapfile -t pairs < <(find_cert_pairs)
+    if [ "${#pairs[@]}" -gt 0 ]; then
+        list_found_certs
+        line_c "${#pairs[@]}" "  0) enter certificate paths manually"
+        line_c 3 "  s) skip (do not serve ${dom} over TLS)"
+        while true; do
+            printf '%s  Select certificate for %s%s: ' "$(next_c)" "$dom" "$R"
+            IFS= read -r pick || pick="s"
+            case "$pick" in
+                s|S|"") return 1 ;;
+                0) break ;;
+            esac
+            if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#pairs[@]}" ]; then
+                c1=$(printf '%s' "${pairs[$((pick - 1))]}" | cut -d'|' -f2)
+                c2=$(printf '%s' "${pairs[$((pick - 1))]}" | cut -d'|' -f3)
+                printf -v "$cvar" '%s' "$c1"
+                printf -v "$kvar" '%s' "$c2"
+                cert_covers_domain "$c1" "$dom" || warn "That certificate does not list ${dom} - browsers will warn"
+                ok "Using ${c1}"
+                return 0
+            fi
+            err "Pick a number, 0 for manual paths, or s to skip."
+        done
+    fi
+    while true; do
+        printf '%s  Full path to certificate for %s (Enter to skip)%s: ' "$(next_c)" "$dom" "$R"
+        IFS= read -r c1 || c1=""
+        [ -z "$c1" ] && return 1
+        if [ ! -f "$c1" ] || ! is_cert_file "$c1"; then
+            err "Not a valid certificate: ${c1}"
+            continue
+        fi
+        printf '%s  Full path to private key%s: ' "$(next_c)" "$R"
+        IFS= read -r c2 || c2=""
+        if [ ! -f "$c2" ] || ! is_key_file "$c2"; then
+            err "Not a valid private key: ${c2}"
+            continue
+        fi
+        if ! key_matches_cert "$c1" "$c2"; then
+            err "This key does not belong to that certificate"
+            continue
+        fi
+        printf -v "$cvar" '%s' "$c1"
+        printf -v "$kvar" '%s' "$c2"
+        ok "Using ${c1}"
+        return 0
+    done
 }
 
 
@@ -1860,11 +1994,11 @@ do_setup() {
 
     step "[6/10] certificate"
     SITE_CERT=""; SITE_KEY=""
-    if auto_select_cert "$DOMAIN"; then
-        ok "Certificate matched for ${DOMAIN}"
+    if resolve_cert "$DOMAIN" SITE_CERT SITE_KEY; then
+        cert_expired "$SITE_CERT" && warn "Certificate for ${DOMAIN} is EXPIRED - renew it"
         SITE_MODE="local"; PANEL_ON_SITE="yes"; SUB_ON_SITE="yes"
     else
-        warn "No certificate covering ${DOMAIN} - site will be HTTP only"
+        warn "No certificate for ${DOMAIN} - site will be HTTP only"
         SITE_MODE="local"; PANEL_ON_SITE="no"; SUB_ON_SITE="no"
         failed_steps=$((failed_steps + 1))
     fi
