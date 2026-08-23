@@ -2765,4 +2765,88 @@ restart_services() {
 
 do_rollback() {
     header
-    if [ ! -e "${BACKU
+    if [ ! -e "${BACKUP_ROOT}/latest" ]; then
+        err "No backup found."
+        pause; return 0
+    fi
+    local dir c
+    dir=$(readlink -f "${BACKUP_ROOT}/latest")
+    step "Rollback"
+    info "Restoring from ${dir}"
+    c=$(ask "Restore database and nginx config? [y/N]" v_yn "no")
+    [ "$c" = "yes" ] || { warn "Cancelled."; pause; return 0; }
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+    [ -f "${dir}/x-ui.db" ] && cp -a "${dir}/x-ui.db" "$DB_PATH"
+    restore_nginx_from "$dir"
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+    apply_nginx "" && ok "Rollback completed"
+    pause
+}
+
+main_menu() {
+    while true; do
+        header
+        line_c 0 "  1) Install  -  full automatic setup"
+        line_c 1 "  2) Add New Inbounds to 443"
+        line_c 2 "  3) Status and Diagnostics"
+        line_c 3 "  4) Restart Services"
+        line_c 4 "  5) Rollback Last Change"
+        line_c 5 "  6) Uninstall Everything"
+        line_c 6 "  0) Exit"
+        local ch
+        printf '%s  Choice%s: ' "$(next_c)" "$R"
+        IFS= read -r ch || ch=0
+        case "$ch" in
+            1) do_setup ;;
+            2) do_sync ;;
+            3) diagnose ;;
+            4) restart_services ;;
+            5) do_rollback ;;
+            6) do_uninstall ;;
+            0) clear; exit 0 ;;
+            *) err "Pick a number from the list."; pause ;;
+        esac
+    done
+}
+
+main() {
+    require_root
+    mkdir -p "$STATE_DIR" "$BACKUP_ROOT" "$LOG_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+    acquire_lock || exit 1
+
+    ensure_deps
+    sync_nginx_paths
+    load_state
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --site) SITE_SRC_ARG="${2:-}"; shift 2 || shift ;;
+            *) break ;;
+        esac
+    done
+
+    case "${1:-}" in
+        --setup)     do_setup; exit 0 ;;
+        --install)   do_setup; exit 0 ;;
+        --sync)      do_sync; exit 0 ;;
+        --uninstall) do_uninstall; exit 0 ;;
+        --rollback)  do_rollback; exit 0 ;;
+        --diagnose)  diagnose; exit 0 ;;
+        --version)   printf 'reality-443 v%s\n' "$SCRIPT_VERSION"; exit 0 ;;
+    esac
+
+    if ! is_installed; then
+        clear
+        header
+        printf '%s ! No installation detected - starting full automatic setup %s\n' "$BG_WARN" "$R"
+        sleep 2
+        do_setup
+    fi
+
+    main_menu
+}
+
+main "$@"
+# END_OF_SCRIPT
