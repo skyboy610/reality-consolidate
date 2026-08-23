@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="5.4.0"
+SCRIPT_VERSION="5.6.0"
 SELF_SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${0:-}")"
 
 DB_PATH="${DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -14,6 +14,7 @@ DISABLED_DIR="${STATE_DIR}/disabled-sites"
 LOG_DIR="/var/log/reality443"
 LOG_FILE="${LOG_DIR}/reality443.log"
 LOCK_FILE="/run/reality443.lock"
+PID_FILE="/run/reality443.pid"
 INSTALL_PATH="/usr/local/bin/reality-443.sh"
 WATCHDOG_PATH="/usr/local/bin/reality443-watchdog.sh"
 GUARD_NAME="reality443-guard"
@@ -118,6 +119,39 @@ rand_str() {
     printf '%s\n' "$s"
 }
 
+is_ancestor_pid() {
+    local target="$1" cur="$$" guard=0
+    while [ -n "$cur" ] && [ "$cur" -gt 1 ] 2>/dev/null; do
+        [ "$cur" = "$target" ] && return 0
+        cur=$(awk '{print $4}' "/proc/${cur}/stat" 2>/dev/null || echo "")
+        guard=$((guard + 1))
+        [ "$guard" -gt 20 ] && break
+    done
+    return 1
+}
+
+acquire_lock() {
+    local oldpid cmd
+    if [ -f "$PID_FILE" ]; then
+        oldpid=$(head -n1 "$PID_FILE" 2>/dev/null | grep -oE '^[0-9]+' || true)
+        if [ -n "$oldpid" ] && [ "$oldpid" != "$$" ] && kill -0 "$oldpid" 2>/dev/null \
+           && ! is_ancestor_pid "$oldpid"; then
+            cmd=$(tr '\0' ' ' < "/proc/${oldpid}/cmdline" 2>/dev/null || true)
+            case "$cmd" in
+                *reality-443.sh*|*reality443*)
+                    err "Another instance is running (PID ${oldpid})."
+                    info "Stop it:        kill ${oldpid}"
+                    info "Or clear it:    rm -f ${PID_FILE}"
+                    return 1 ;;
+            esac
+        fi
+        rm -f "$PID_FILE"
+    fi
+    printf '%s\n' "$$" > "$PID_FILE" 2>/dev/null || true
+    trap 'rm -f "$PID_FILE" 2>/dev/null || true' EXIT
+    return 0
+}
+
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         err "Must run as root: sudo bash $0"
@@ -207,6 +241,147 @@ backend_ip() {
     if is_private_ip "$1"; then printf '%s\n' "$1"; else printf '127.0.0.1\n'; fi
 }
 
+preflight_443() {
+    local owner pp sp
+    pp=$(panel_port); sp=$(sub_port)
+    if [ "$pp" = "443" ]; then
+        systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+        refresh_taken_ports
+        alloc_port "" || return 1
+        set_setting webPort "$ALLOC_PORT"
+        warn "Panel was on port 443 - moved to ${ALLOC_PORT}"
+        systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+        sleep 2
+    fi
+    if [ "$sp" = "443" ]; then
+        systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+        refresh_taken_ports
+        alloc_port "" || return 1
+        set_setting subPort "$ALLOC_PORT"
+        warn "Subscription was on port 443 - moved to ${ALLOC_PORT}"
+        systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+        sleep 2
+    fi
+    if port_busy 443; then
+        owner=$(port_owner 443)
+        case "$owner" in
+            nginx|"") ;;
+            *)
+                err "Port 443 is held by '${owner}', not nginx."
+                info "Stop that service first, then run the installer again."
+                info "Find it with:  ss -ltnp '( sport = :443 )'"
+                return 1 ;;
+        esac
+    fi
+    if http_binds_443; then
+        warn "Another nginx site listens on 443 in the http block - moving it aside"
+        disable_stock_default_site
+    fi
+    return 0
+}
+
+http_probe() {
+    local host="$1" path="${2:-/}" c
+    c=$(timeout 15 curl -sk -o /dev/null -w '%{http_code}' --resolve "${host}:443:127.0.0.1" "https://${host}${path}" 2>/dev/null)
+    c=$(printf '%s' "$c" | head -n1 | grep -oE '^[0-9]{3}' | head -n1)
+    printf '%s' "${c:-000}"
+}
+
+TEST_FAILS=0
+post_install_test() {
+    local fails=0 out code sni i
+    step "Live self-test"
+
+    if systemctl is-active --quiet "$NGINX_SERVICE"; then
+        ok "nginx service is active"
+    else
+        err "nginx service is NOT active"
+        systemctl status "$NGINX_SERVICE" --no-pager 2>&1 | tail -n 8 >&2
+        fails=$((fails + 1))
+    fi
+
+    if port_busy 443; then
+        out=$(port_owner 443)
+        if [ "$out" = "nginx" ] || [ -z "$out" ]; then
+            ok "port 443 is bound by nginx"
+        else
+            err "port 443 is bound by '${out}' instead of nginx"
+            fails=$((fails + 1))
+        fi
+    else
+        err "nothing is listening on port 443"
+        info "check:  journalctl -u ${NGINX_SERVICE} -n 30 --no-pager"
+        fails=$((fails + 1))
+    fi
+
+    if [ -n "$SITE_CERT" ] && [ -n "$DOMAIN" ]; then
+        out=$(timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null | grep -m1 'subject=' || true)
+        if [ -n "$out" ]; then
+            ok "TLS handshake for ${DOMAIN} succeeded"
+        else
+            err "TLS handshake for ${DOMAIN} FAILED on 127.0.0.1:443"
+            fails=$((fails + 1))
+        fi
+        if have curl; then
+            code=$(http_probe "$DOMAIN" "/")
+            if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+                ok "camouflage site answers on https://${DOMAIN}/ (HTTP ${code})"
+            else
+                err "site on https://${DOMAIN}/ returned HTTP ${code}"
+                fails=$((fails + 1))
+            fi
+        fi
+    fi
+
+    if sub_is_separate && have curl; then
+        out=$(timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$SUB_DOMAIN" </dev/null 2>/dev/null | grep -m1 'subject=' || true)
+        if [ -n "$out" ]; then
+            ok "TLS handshake for ${SUB_DOMAIN} succeeded"
+        else
+            err "TLS handshake for ${SUB_DOMAIN} FAILED"
+            fails=$((fails + 1))
+        fi
+        code=$(http_probe "$SUB_DOMAIN" "/")
+        if [ "$code" = "200" ]; then
+            ok "camouflage site answers on https://${SUB_DOMAIN}/ (HTTP 200)"
+        else
+            err "site on https://${SUB_DOMAIN}/ returned HTTP ${code}"
+            fails=$((fails + 1))
+        fi
+    fi
+
+    for ((i = 0; i < ${#RI_ID[@]}; i++)); do
+        is_routable_listen "${RI_LISTEN[$i]}" || continue
+        sni="${RI_SNI[$i]}"
+        [ -n "$sni" ] || continue
+        if port_busy "${RI_PORT[$i]}"; then
+            ok "${RI_REMARK[$i]:-inbound} listening on ${RI_PORT[$i]}"
+        else
+            err "${RI_REMARK[$i]:-inbound} is NOT listening on ${RI_PORT[$i]}"
+            info "check:  journalctl -u ${XUI_SERVICE} -n 30 --no-pager"
+            fails=$((fails + 1))
+        fi
+    done
+
+    if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        if ufw status 2>/dev/null | grep -qE '^443/tcp'; then
+            ok "firewall allows 443/tcp"
+        else
+            err "firewall is active but 443/tcp is NOT allowed"
+            fails=$((fails + 1))
+        fi
+    fi
+
+    echo
+    TEST_FAILS="$fails"
+    if [ "$fails" -eq 0 ]; then
+        ok "Self-test passed - the server answers on 443"
+        return 0
+    fi
+    err "Self-test found ${fails} problem(s) - see the lines marked with a cross above"
+    return 1
+}
+
 is_installed() {
     [ -f "$STREAM_FILE" ] || return 1
     grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null || return 1
@@ -242,6 +417,7 @@ ensure_deps() {
     have jq || missing+=(jq)
     have ss || missing+=(iproute2)
     have openssl || missing+=(openssl)
+    have curl || missing+=(curl)
     have flock || missing+=(util-linux)
     if [ "${#missing[@]}" -gt 0 ]; then
         info "Installing dependencies: ${missing[*]}"
@@ -1798,6 +1974,16 @@ UNIT
     return 1
 }
 
+collect_open_ports() {
+    local p lst
+    {
+        xval "SELECT DISTINCT port FROM inbounds WHERE port IS NOT NULL;" 2>/dev/null
+        panel_port
+        sub_port
+        printf '80\n443\n'
+    } | grep -E '^[0-9]+$' | sort -un
+}
+
 setup_firewall_auto() {
     local -a sports=()
     mapfile -t sports < <(ssh_ports)
@@ -1812,6 +1998,7 @@ setup_firewall_auto() {
         warn "ufw not available - firewall step skipped"
         return 1
     fi
+
     local sp failed=0
     for sp in "${sports[@]}"; do
         fw_allow "$sp" "SSH" || failed=$((failed + 1))
@@ -1824,11 +2011,20 @@ setup_firewall_auto() {
         err "SSH rule did not register - firewall left untouched"
         return 1
     fi
-    fw_allow 80 "http" || true
-    fw_allow 443 "https" || true
-    fw_allow 443 "quic" udp || true
-    fw_allow "$(panel_port)" "panel" || true
-    fw_allow "$(sub_port)" "subscription" || true
+
+    local -a plist=()
+    mapfile -t plist < <(collect_open_ports)
+    local n=0
+    for sp in "${plist[@]}"; do
+        [ -n "$sp" ] || continue
+        [ "$sp" -ge 1 ] 2>/dev/null || continue
+        [ "$sp" -le 65535 ] || continue
+        ufw allow "${sp}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${sp}/udp" >/dev/null 2>&1 || true
+        n=$((n + 1))
+    done
+    ok "Opened ${n} port(s) from the x-ui database plus 80 and 443 (tcp+udp)"
+
     if ! ufw --force enable >/dev/null 2>&1; then
         err "Could not enable ufw"
         return 1
@@ -1842,7 +2038,12 @@ setup_firewall_auto() {
         err "SSH port not open after enabling - firewall disabled again for safety"
         return 1
     fi
-    ok "Firewall active (SSH ${sports[*]}, 80, 443 tcp+udp, panel, subscription)"
+    if ! ufw status 2>/dev/null | grep -qE '^443/tcp'; then
+        ufw disable >/dev/null 2>&1 || true
+        err "Port 443 not open after enabling - firewall disabled again for safety"
+        return 1
+    fi
+    ok "Firewall active - SSH ${sports[*]}, 443, and every inbound port are open"
     return 0
 }
 
@@ -1869,13 +2070,25 @@ verify_live() {
 success_report() {
     local ppath issues="${1:-0}"
     echo
-    printf '%s ✓ Installation completed successfully %s\n' "$BG_OK" "$R"
-    printf '%s ✓ Configuration applied successfully %s\n' "$BG_OK" "$R"
-    printf '%s ✓ Kernel and socket tuning applied %s\n' "$BG_OK" "$R"
-    printf '%s ✓ 443 routing started successfully %s\n' "$BG_OK" "$R"
-    printf '%s ✓ Service enabled successfully %s\n' "$BG_OK" "$R"
-    printf '%s ✓ Auto-start enabled %s\n' "$BG_OK" "$R"
-    printf '%s ✓ Automatic reconnect configured %s\n' "$BG_OK" "$R"
+    if [ "$issues" -eq 0 ]; then
+        printf '%s ✓ Installation completed successfully %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Configuration applied successfully %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Kernel and socket tuning applied %s\n' "$BG_OK" "$R"
+        printf '%s ✓ 443 routing started successfully %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Service enabled successfully %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Auto-start enabled %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Automatic reconnect configured %s\n' "$BG_OK" "$R"
+    else
+        printf '%s ✗ INSTALLATION INCOMPLETE - %s check(s) failed %s\n' "$BG_ERR" "$issues" "$R"
+        printf '%s ! The server is NOT serving traffic correctly yet %s\n' "$BG_WARN" "$R"
+        printf '%s ! Fix the lines marked with a cross above, then run option 1 again %s\n' "$BG_WARN" "$R"
+        echo
+        printf '%s  Useful commands:%s\n' "$C_SLATE" "$R"
+        printf '%s    nginx -t%s\n' "$C_STEEL" "$R"
+        printf '%s    systemctl status nginx %s --no-pager%s\n' "$C_STEEL" "$XUI_SERVICE" "$R"
+        printf '%s    journalctl -u %s -n 40 --no-pager%s\n' "$C_STEEL" "$XUI_SERVICE" "$R"
+        printf '%s    ss -ltnp | grep -E ":443|:80"%s\n' "$C_STEEL" "$R"
+    fi
     echo
     printf '%s  Domain      %s%s\n' "$C_TURQ" "$DOMAIN" "$R"
     if [ "$PANEL_ON_SITE" = "yes" ]; then
@@ -1889,9 +2102,6 @@ success_report() {
     printf '%s  Watchdog    %s%s\n' "$C_LILAC" "$(systemctl is-active "${GUARD_NAME}.service" 2>/dev/null || echo inactive)" "$R"
     printf '%s  Firewall    %s%s\n' "$C_ROSE" "$(ufw status 2>/dev/null | head -1 | sed 's/Status: //' || echo 'not installed')" "$R"
     echo
-    if [ "$issues" -gt 0 ]; then
-        printf '%s ! %s step(s) need attention - see the messages above %s\n\n' "$BG_WARN" "$issues" "$R"
-    fi
     if [ "$SUB_DOMAIN" != "$DOMAIN" ]; then
         printf '%s  Point %s, %s and every Reality SNI at this server IP.%s\n' "$C_SLATE" "$DOMAIN" "$SUB_DOMAIN" "$R"
     else
@@ -1947,6 +2157,10 @@ do_setup() {
     fi
     sync_nginx_paths
     ok "nginx ready with stream support"
+    if ! preflight_443; then
+        err "Port 443 is not available - fix the conflict above and run again"
+        pause; return 0
+    fi
 
     bdir=$(backup_now)
     save_original_ports
@@ -2047,7 +2261,7 @@ do_setup() {
         failed_steps=$((failed_steps + 1))
     fi
 
-    verify_live || failed_steps=$((failed_steps + 1))
+    post_install_test || failed_steps=$((failed_steps + TEST_FAILS))
     success_report "$failed_steps"
     pause
 }
@@ -2394,11 +2608,7 @@ main() {
     mkdir -p "$STATE_DIR" "$BACKUP_ROOT" "$LOG_DIR"
     chmod 700 "$STATE_DIR" 2>/dev/null || true
 
-    exec 8>"${LOCK_FILE}.ui"
-    if ! flock -n 8; then
-        err "Another instance of this script is already running."
-        exit 1
-    fi
+    acquire_lock || exit 1
 
     ensure_deps
     sync_nginx_paths
