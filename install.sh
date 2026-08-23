@@ -13,7 +13,7 @@ _integrity() {
 }
 _integrity
 
-SCRIPT_VERSION="6.1.0"
+SCRIPT_VERSION="6.4.0"
 SELF_SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${0:-}")"
 
 DB_PATH="${DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -21,6 +21,7 @@ STATE_DIR="/etc/reality443"
 STATE_FILE="${STATE_DIR}/state.json"
 PORTS_FILE="${STATE_DIR}/original-ports.json"
 ROUTED_FILE="${STATE_DIR}/routed-ports.json"
+HOSTS_FILE="${STATE_DIR}/created-hosts.json"
 BACKUP_ROOT="${STATE_DIR}/backups"
 DISABLED_DIR="${STATE_DIR}/disabled-sites"
 LOG_DIR="/var/log/reality443"
@@ -857,9 +858,29 @@ save_state() {
 
 save_original_ports() {
     mkdir -p "$STATE_DIR"
-    [ -f "$PORTS_FILE" ] && return 0
+    if [ -f "$PORTS_FILE" ] && [ -s "$PORTS_FILE" ]; then
+        return 0
+    fi
     q "SELECT id, listen, port FROM inbounds;" > "$PORTS_FILE"
+    if [ ! -s "$PORTS_FILE" ]; then
+        err "Could not record original inbound ports - uninstall will not be able to restore them"
+        rm -f "$PORTS_FILE"
+        return 1
+    fi
     chmod 600 "$PORTS_FILE" 2>/dev/null || true
+    ok "Original inbound state recorded ($(jq 'length' "$PORTS_FILE") inbound(s))"
+    return 0
+}
+
+track_created_host() {
+    local hid="$1"
+    [ -n "$hid" ] || return 0
+    mkdir -p "$STATE_DIR"
+    [ -f "$HOSTS_FILE" ] || printf '[]' > "$HOSTS_FILE"
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson h "$hid" '. + [$h] | unique' "$HOSTS_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$HOSTS_FILE" || rm -f "$tmp"
+    return 0
 }
 
 save_routed_ports() {
@@ -1587,9 +1608,11 @@ set_inbound_host() {
         existing=$(xval "SELECT id FROM hosts WHERE inbound_id=${id} LIMIT 1;")
         if [ -n "$existing" ]; then
             xsql "UPDATE hosts SET address='${ea}', port=${hport}, remark='${er}' WHERE id=${existing};" || true
+            track_created_host "$existing"
         else
             xsql "INSERT INTO hosts (inbound_id, remark, address, port, security) VALUES (${id}, '${er}', '${ea}', ${hport}, 'same');" \
                 || xsql "INSERT INTO hosts (inbound_id, remark, address, port) VALUES (${id}, '${er}', '${ea}', ${hport});" || true
+            track_created_host "$(xval "SELECT id FROM hosts WHERE inbound_id=${id} ORDER BY id DESC LIMIT 1;")"
         fi
     else
         sj=$(q "SELECT stream_settings FROM inbounds WHERE id=${id};" | jq -r '.[0].stream_settings')
@@ -2666,6 +2689,138 @@ diagnose() {
 }
 
 
+clear_external_proxy() {
+    local json n i id sj new cleaned=0
+    json=$(q "SELECT id, stream_settings FROM inbounds;")
+    n=$(printf '%s' "$json" | jq 'length')
+    for ((i = 0; i < n; i++)); do
+        id=$(printf '%s' "$json" | jq -r ".[$i].id")
+        sj=$(printf '%s' "$json" | jq -r ".[$i].stream_settings // \"\"")
+        [ -n "$sj" ] || continue
+        printf '%s' "$sj" | jq -e '.externalProxy' >/dev/null 2>&1 || continue
+        new=$(printf '%s' "$sj" | jq -c 'del(.externalProxy)' 2>/dev/null) || continue
+        [ -n "$new" ] || continue
+        xsql "UPDATE inbounds SET stream_settings='$(esc "$new")' WHERE id=${id};" || true
+        cleaned=$((cleaned + 1))
+    done
+    [ "$cleaned" -gt 0 ] && ok "Cleared external proxy from ${cleaned} inbound(s)"
+    return 0
+}
+
+unbind_loopback_inbounds() {
+    local json n i id rem lst prt fixed=0
+    refresh_taken_ports
+    json=$(q "SELECT id, remark, listen, port FROM inbounds;")
+    n=$(printf '%s' "$json" | jq 'length')
+    for ((i = 0; i < n; i++)); do
+        id=$(printf '%s' "$json" | jq -r ".[$i].id")
+        rem=$(printf '%s' "$json" | jq -r ".[$i].remark // \"\"")
+        lst=$(printf '%s' "$json" | jq -r ".[$i].listen // \"\"")
+        prt=$(printf '%s' "$json" | jq -r ".[$i].port")
+        [ "$lst" = "127.0.0.1" ] || continue
+        if [ "$prt" -ge "$MIN_PORT" ] && [ "$prt" -le "$MAX_PORT" ] 2>/dev/null; then
+            xsql "UPDATE inbounds SET listen='' WHERE id=${id};" || true
+            ok "'${rem}' unbound from loopback - now reachable on port ${prt}"
+            fixed=$((fixed + 1))
+        fi
+    done
+    [ "$fixed" -eq 0 ] && return 0
+    warn "${fixed} inbound(s) kept their internal port but now listen on all interfaces"
+    return 0
+}
+
+reopen_all_inbound_ports() {
+    have ufw || return 0
+    ufw status 2>/dev/null | grep -qi '^Status: active' || return 0
+    local -a plist=()
+    mapfile -t plist < <(collect_open_ports)
+    local sp n=0
+    for sp in "${plist[@]}"; do
+        [ -n "$sp" ] || continue
+        [ "$sp" -ge 1 ] 2>/dev/null || continue
+        [ "$sp" -le 65535 ] || continue
+        ufw allow "${sp}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${sp}/udp" >/dev/null 2>&1 || true
+        n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && ok "Firewall reopened for ${n} restored port(s)"
+    return 0
+}
+
+restore_inbounds() {
+    db_ready || { warn "Database unreachable - inbounds not restored"; return 1; }
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+
+    if [ -f "$PORTS_FILE" ]; then
+        local n i id lst prt
+        n=$(jq 'length' "$PORTS_FILE" 2>/dev/null || echo 0)
+        for ((i = 0; i < n; i++)); do
+            id=$(jq -r ".[$i].id" "$PORTS_FILE")
+            lst=$(jq -r ".[$i].listen // \"\"" "$PORTS_FILE")
+            prt=$(jq -r ".[$i].port" "$PORTS_FILE")
+            [ -n "$id" ] || continue
+            xsql "UPDATE inbounds SET listen='$(esc "$lst")', port=${prt} WHERE id=${id};" || true
+        done
+        ok "Restored original listen address and port for ${n} inbound(s)"
+    else
+        warn "No original-ports record found"
+    fi
+
+    clear_external_proxy
+
+    local hn=0 hid d c
+    if [ -f "$HOSTS_FILE" ]; then
+        while IFS= read -r hid; do
+            [ -n "$hid" ] || continue
+            [[ "$hid" =~ ^[0-9]+$ ]] || continue
+            xsql "DELETE FROM hosts WHERE id=${hid};" || true
+            hn=$((hn + 1))
+        done < <(jq -r '.[]' "$HOSTS_FILE" 2>/dev/null)
+    fi
+    for d in "$DOMAIN" "$SUB_DOMAIN"; do
+        [ -n "$d" ] || continue
+        c=$(xval "SELECT COUNT(*) FROM hosts WHERE address='$(esc "$d")';" 2>/dev/null || echo 0)
+        [ -n "$c" ] || c=0
+        if [ "$c" -gt 0 ]; then
+            xsql "DELETE FROM hosts WHERE address='$(esc "$d")';" || true
+            hn=$((hn + c))
+        fi
+    done
+    if [ "$hn" -gt 0 ]; then
+        ok "Removed ${hn} host row(s) created by this script"
+    else
+        info "No host rows to remove"
+    fi
+
+    unbind_loopback_inbounds
+    reopen_all_inbound_ports
+
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+    sleep 3
+    if systemctl is-active --quiet "$XUI_SERVICE"; then
+        ok "x-ui restarted - inbounds are live again"
+    else
+        err "x-ui did not start - run: systemctl status ${XUI_SERVICE}"
+    fi
+
+    local json n2 i2 rem2 lst2 prt2
+    json=$(q "SELECT remark, listen, port FROM inbounds WHERE enable=1 OR enable IS NULL;")
+    n2=$(printf '%s' "$json" | jq 'length')
+    echo
+    step "Inbound state after restore"
+    for ((i2 = 0; i2 < n2; i2++)); do
+        rem2=$(printf '%s' "$json" | jq -r ".[$i2].remark // \"\"")
+        lst2=$(printf '%s' "$json" | jq -r ".[$i2].listen // \"\"")
+        prt2=$(printf '%s' "$json" | jq -r ".[$i2].port")
+        if port_busy "$prt2"; then
+            ok "${rem2}  ${lst2:-0.0.0.0}:${prt2}  listening"
+        else
+            err "${rem2}  ${lst2:-0.0.0.0}:${prt2}  NOT listening"
+        fi
+    done
+    return 0
+}
+
 do_uninstall() {
     header
     step "Full uninstall"
@@ -2702,31 +2857,8 @@ do_uninstall() {
     rm -f /etc/cron.d/reality443 2>/dev/null || true
     ok "Cron entries removed"
 
-    if [ -f "$PORTS_FILE" ] && db_ready; then
-        local n i id lst prt
-        n=$(jq 'length' "$PORTS_FILE")
-        systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-        for ((i = 0; i < n; i++)); do
-            id=$(jq -r ".[$i].id" "$PORTS_FILE")
-            lst=$(jq -r ".[$i].listen // \"\"" "$PORTS_FILE")
-            prt=$(jq -r ".[$i].port" "$PORTS_FILE")
-            xsql "UPDATE inbounds SET listen='$(esc "$lst")', port=${prt} WHERE id=${id};" || true
-        done
-        ok "Inbound ports restored"
-    else
-        warn "No original port record - inbound ports left unchanged."
-    fi
-
-    if db_ready && [ -n "$DOMAIN" ]; then
-        local hn
-        hn=$(xval "SELECT COUNT(*) FROM hosts WHERE address='$(esc "$DOMAIN")';" 2>/dev/null || echo 0)
-        [ -n "$hn" ] || hn=0
-        if [ "$hn" -gt 0 ]; then
-            xsql "DELETE FROM hosts WHERE address='$(esc "$DOMAIN")';" || true
-            ok "Removed ${hn} host row(s)"
-        fi
-    fi
-    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+    step "Restoring inbounds"
+    restore_inbounds || true
 
     unhook_stream_include
     rm -f "$STREAM_FILE" "$SITE_CONF" "$NGINX_TUNE"
@@ -2762,7 +2894,7 @@ do_uninstall() {
         fi
     fi
 
-    rm -f "$STATE_FILE" "$PORTS_FILE" "$ROUTED_FILE" "$LOCK_FILE" "$WATCHDOG_PATH"
+    rm -f "$STATE_FILE" "$PORTS_FILE" "$ROUTED_FILE" "$HOSTS_FILE" "$LOCK_FILE" "$WATCHDOG_PATH"
     rm -f /run/reality443-watchdog.lock
     rm -rf "$LOG_DIR"
     rm -f /usr/local/bin/reality443
@@ -2873,9 +3005,18 @@ main() {
     if ! is_installed; then
         clear
         header
-        printf '%s ! No installation detected - starting full automatic setup %s\n' "$BG_WARN" "$R"
-        sleep 2
-        do_setup
+        printf '%s ! No installation detected %s\n\n' "$BG_WARN" "$R"
+        line_c 0 "  Full automatic setup starts in 6 seconds."
+        line_c 1 "  Press any key to open the menu instead."
+        echo
+        local _k=""
+        if [ -t 0 ] && read -r -n 1 -t 6 _k 2>/dev/null; then
+            echo
+            info "Opening menu"
+        else
+            echo
+            do_setup
+        fi
     fi
 
     main_menu
