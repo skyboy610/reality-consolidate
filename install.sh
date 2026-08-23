@@ -13,7 +13,7 @@ _integrity() {
 }
 _integrity
 
-SCRIPT_VERSION="6.0.0"
+SCRIPT_VERSION="6.1.0"
 SELF_SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${0:-}")"
 
 DB_PATH="${DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -292,11 +292,30 @@ preflight_443() {
     return 0
 }
 
+server_public_ip() {
+    local ip=""
+    ip=$(timeout 8 curl -4 -fsSL ifconfig.co 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
+    ip=$(timeout 8 curl -4 -fsSL icanhazip.com 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
+    ip=$(timeout 8 curl -4 -fsSL api.ipify.org 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
+    ip=$(timeout 8 curl -4 -fsSL ip.sb 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
+    return 1
+}
+
 server_ips() {
+    local pub
+    pub=$(server_public_ip)
     {
+        [ -n "$pub" ] && printf '%s\n' "$pub"
         ip -4 route get 8.8.8.8 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}'
         ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
-    } | grep -E '^[0-9.]+$' | sort -u
+    } | grep -E '^[0-9]+\.' | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)' | sort -u
+    if [ -z "$pub" ]; then
+        ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u
+    fi
 }
 
 resolve_a() {
@@ -316,6 +335,8 @@ check_dns() {
         return 0
     fi
     local d ips ip m match bad=0
+    local pub
+    pub=$(server_public_ip)
     local -a doms=("$DOMAIN")
     [ -n "$SUB_DOMAIN" ] && [ "$SUB_DOMAIN" != "$DOMAIN" ] && doms+=("$SUB_DOMAIN")
     for d in "${doms[@]}"; do
@@ -336,9 +357,21 @@ check_dns() {
         if [ "$match" -eq 1 ]; then
             ok "${d} resolves to this server"
         else
-            err "${d} resolves to $(printf '%s' "$ips" | tr '\n' ' ' | sed 's/ *$//') - NOT this server (${mine[0]})"
-            info "fix the A record:  ${d}  ->  ${mine[0]}"
-            bad=$((bad + 1))
+            local resolved
+            resolved=$(printf '%s' "$ips" | tr '\n' ' ' | sed 's/ *$//')
+            local is_cdn=0
+            for ip in $ips; do
+                if timeout 8 curl -sk -o /dev/null -w '%{http_code}' --resolve "${d}:443:${ip}" "https://${d}/" 2>/dev/null | grep -qE '^(200|301|302|403)$'; then
+                    is_cdn=1
+                fi
+            done
+            if [ "$is_cdn" -eq 1 ]; then
+                ok "${d} is behind a CDN/proxy (${resolved}) - this is fine if the origin is set to ${pub:-this server}"
+            else
+                err "${d} resolves to ${resolved} - NOT this server (${pub:-${mine[0]:-unknown}})"
+                info "fix the A record:  ${d}  ->  ${pub:-${mine[0]:-<your-public-ip>}}"
+                bad=$((bad + 1))
+            fi
         fi
     done
     [ "$bad" -eq 0 ] && return 0
