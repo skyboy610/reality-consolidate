@@ -140,6 +140,8 @@ acquire_lock() {
             case "$cmd" in
                 *reality-443.sh*|*reality443*)
                     err "Another instance is running (PID ${oldpid})."
+                    info "Stop it:        kill ${oldpid}"
+                    info "Or clear it:    rm -f ${PID_FILE}"
                     return 1 ;;
             esac
         fi
@@ -247,6 +249,7 @@ preflight_443() {
         refresh_taken_ports
         alloc_port "" || return 1
         set_setting webPort "$ALLOC_PORT"
+        warn "Panel was on port 443 - moved to ${ALLOC_PORT}"
         systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
         sleep 2
     fi
@@ -255,6 +258,7 @@ preflight_443() {
         refresh_taken_ports
         alloc_port "" || return 1
         set_setting subPort "$ALLOC_PORT"
+        warn "Subscription was on port 443 - moved to ${ALLOC_PORT}"
         systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
         sleep 2
     fi
@@ -264,17 +268,15 @@ preflight_443() {
             nginx|"") ;;
             *)
                 err "Port 443 is held by '${owner}', not nginx."
+                info "Stop that service first, then run the installer again."
+                info "Find it with:  ss -ltnp '( sport = :443 )'"
                 return 1 ;;
         esac
     fi
     if http_binds_443; then
+        warn "Another nginx site listens on 443 in the http block - moving it aside"
         disable_stock_default_site
     fi
-    return 0
-}
-
-http_binds_443() {
-    grep -RiqE 'listen.*443' /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null || return 1
     return 0
 }
 
@@ -298,6 +300,7 @@ check_dns() {
     local -a mine=()
     mapfile -t mine < <(server_ips)
     if [ "${#mine[@]}" -eq 0 ]; then
+        warn "Could not determine this server's public IP - skipping DNS check"
         return 0
     fi
     local d ips ip m match bad=0
@@ -307,6 +310,8 @@ check_dns() {
         [ -n "$d" ] || continue
         ips=$(resolve_a "$d")
         if [ -z "$ips" ]; then
+            err "${d} has no A record - it does not resolve at all"
+            info "create an A record:  ${d}  ->  ${mine[0]}"
             bad=$((bad + 1))
             continue
         fi
@@ -319,7 +324,8 @@ check_dns() {
         if [ "$match" -eq 1 ]; then
             ok "${d} resolves to this server"
         else
-            err "${d} DNS mismatch"
+            err "${d} resolves to $(printf '%s' "$ips" | tr '\n' ' ' | sed 's/ *$//') - NOT this server (${mine[0]})"
+            info "fix the A record:  ${d}  ->  ${mine[0]}"
             bad=$((bad + 1))
         fi
     done
@@ -338,9 +344,10 @@ check_reality_chain() {
         out=$(timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$sni" </dev/null 2>&1 || true)
         subj=$(printf '%s' "$out" | grep -m1 -oE 'subject=.*' | head -c 90)
         if [ -n "$subj" ]; then
-            ok "${sni} -> OK (${subj})"
+            ok "${sni} -> Reality chain OK (${subj})"
         else
-            err "${sni} -> FAILED"
+            err "${sni} -> no certificate returned through 443"
+            info "xray is listening but the Reality handshake to its dest is failing"
             bad=$((bad + 1))
         fi
     done
@@ -376,11 +383,21 @@ check_reality_dests() {
             alpn=$(printf '%s' "$out" | grep -m1 -oE 'ALPN protocol: [a-z0-9/.]+' | sed 's/.*: //')
         fi
         if [ "$proto" = "TLSv1.3" ] && [ "$alpn" = "h2" ]; then
-            ok "${RI_REMARK[$i]:-inbound}: dest ${dest} OK"
+            ok "${RI_REMARK[$i]:-inbound}: dest ${dest} supports TLS1.3 + h2"
+        elif [ "$proto" = "TLSv1.3" ]; then
+            warn "${RI_REMARK[$i]:-inbound}: dest ${dest} has TLS1.3 but ALPN='${alpn:-none}' (h2 expected)"
+            bad=$((bad + 1))
+        elif [ -n "$proto" ]; then
+            err "${RI_REMARK[$i]:-inbound}: dest ${dest} only speaks ${proto} - Reality REQUIRES TLS 1.3"
+            info "clients will fail to connect through this inbound"
+            bad=$((bad + 1))
         else
-            warn "${RI_REMARK[$i]:-inbound}: dest ${dest} validation failed"
+            err "${RI_REMARK[$i]:-inbound}: dest ${dest} is unreachable from this server"
             bad=$((bad + 1))
         fi
+        case "$host" in
+            *.ir|*.ir:*) warn "${host} is an Iranian domain - a poor Reality target, prefer a foreign CDN host" ;;
+        esac
     done
     [ "$bad" -eq 0 ] && return 0
     return 1
@@ -398,6 +415,8 @@ check_orphan_inbounds() {
         is_routable_listen "$lst" || continue
         sec=$(printf '%s' "$json" | jq -r ".[$i].stream_settings | fromjson? | .security // \"\"")
         if [ "$sec" != "reality" ]; then
+            err "'${rem}' listens on ${lst}:${prt} but is not Reality - it is unreachable from outside"
+            info "give it a public listen address in the panel, or delete it"
             orphans=$((orphans + 1))
             continue
         fi
@@ -407,6 +426,8 @@ check_orphan_inbounds() {
             grep -qF "\"${sn}\"" "$STREAM_FILE" 2>/dev/null && { found=1; break; }
         done
         if [ "$found" -eq 0 ]; then
+            err "'${rem}' listens on ${lst}:${prt} but NO SNI of it is routed on 443 - it is dead"
+            info "run option 2 (Add New Inbounds) to route it, or give it a serverName in the panel"
             orphans=$((orphans + 1))
         fi
     done
@@ -427,31 +448,59 @@ post_install_test() {
     step "Live self-test"
 
     if systemctl is-active --quiet "$NGINX_SERVICE"; then
-        ok "nginx OK"
+        ok "nginx service is active"
     else
-        err "nginx FAILED"
+        err "nginx service is NOT active"
+        systemctl status "$NGINX_SERVICE" --no-pager 2>&1 | tail -n 8 >&2
         fails=$((fails + 1))
     fi
 
     if port_busy 443; then
         out=$(port_owner 443)
         if [ "$out" = "nginx" ] || [ -z "$out" ]; then
-            ok "port 443 OK"
+            ok "port 443 is bound by nginx"
         else
-            err "port 443 FAILED"
+            err "port 443 is bound by '${out}' instead of nginx"
             fails=$((fails + 1))
         fi
     else
-        err "port 443 is DOWN"
+        err "nothing is listening on port 443"
+        info "check:  journalctl -u ${NGINX_SERVICE} -n 30 --no-pager"
         fails=$((fails + 1))
     fi
 
     if [ -n "$SITE_CERT" ] && [ -n "$DOMAIN" ]; then
         out=$(timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null | grep -m1 'subject=' || true)
         if [ -n "$out" ]; then
-            ok "TLS handshake ${DOMAIN} OK"
+            ok "TLS handshake for ${DOMAIN} succeeded"
         else
-            err "TLS handshake ${DOMAIN} FAILED"
+            err "TLS handshake for ${DOMAIN} FAILED on 127.0.0.1:443"
+            fails=$((fails + 1))
+        fi
+        if have curl; then
+            code=$(http_probe "$DOMAIN" "/")
+            if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+                ok "camouflage site answers on https://${DOMAIN}/ (HTTP ${code})"
+            else
+                err "site on https://${DOMAIN}/ returned HTTP ${code}"
+                fails=$((fails + 1))
+            fi
+        fi
+    fi
+
+    if sub_is_separate && have curl; then
+        out=$(timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$SUB_DOMAIN" </dev/null 2>/dev/null | grep -m1 'subject=' || true)
+        if [ -n "$out" ]; then
+            ok "TLS handshake for ${SUB_DOMAIN} succeeded"
+        else
+            err "TLS handshake for ${SUB_DOMAIN} FAILED"
+            fails=$((fails + 1))
+        fi
+        code=$(http_probe "$SUB_DOMAIN" "/")
+        if [ "$code" = "200" ]; then
+            ok "camouflage site answers on https://${SUB_DOMAIN}/ (HTTP 200)"
+        else
+            err "site on https://${SUB_DOMAIN}/ returned HTTP ${code}"
             fails=$((fails + 1))
         fi
     fi
@@ -461,25 +510,39 @@ post_install_test() {
         sni="${RI_SNI[$i]}"
         [ -n "$sni" ] || continue
         if port_busy "${RI_PORT[$i]}"; then
-            ok "${RI_REMARK[$i]:-inbound} port OK"
+            ok "${RI_REMARK[$i]:-inbound} listening on ${RI_PORT[$i]}"
         else
-            err "${RI_REMARK[$i]:-inbound} port FAILED"
+            err "${RI_REMARK[$i]:-inbound} is NOT listening on ${RI_PORT[$i]}"
+            info "check:  journalctl -u ${XUI_SERVICE} -n 30 --no-pager"
             fails=$((fails + 1))
         fi
     done
 
+    if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        if ufw status 2>/dev/null | grep -qE '^443/tcp'; then
+            ok "firewall allows 443/tcp"
+        else
+            err "firewall is active but 443/tcp is NOT allowed"
+            fails=$((fails + 1))
+        fi
+    else
+        warn "ufw is not active - the server relies on the provider firewall only"
+    fi
+
     check_orphan_inbounds || fails=$((fails + 1))
+    step "DNS"
     check_dns || fails=$((fails + 1))
+    step "Reality end-to-end probe through 443"
     check_reality_chain || fails=$((fails + 1))
     check_reality_dests || fails=$((fails + 1))
 
     echo
     TEST_FAILS="$fails"
     if [ "$fails" -eq 0 ]; then
-        ok "Self-test passed"
+        ok "Self-test passed - the server answers on 443"
         return 0
     fi
-    err "Self-test found ${fails} problem(s)"
+    err "Self-test found ${fails} problem(s) - see the lines marked with a cross above"
     return 1
 }
 
@@ -522,11 +585,12 @@ ensure_deps() {
     have dig || missing+=(dnsutils)
     have flock || missing+=(util-linux)
     if [ "${#missing[@]}" -gt 0 ]; then
+        info "Installing dependencies: ${missing[*]}"
         install_pkgs "${missing[@]}" || true
     fi
     local fatal=0
-    have sqlite3 || fatal=1
-    have jq || fatal=1
+    have sqlite3 || { err "sqlite3 is required and could not be installed."; fatal=1; }
+    have jq || { err "jq is required and could not be installed."; fatal=1; }
     [ "$fatal" -eq 0 ] || exit 1
 }
 
@@ -540,8 +604,9 @@ xsql() {
 }
 
 db_ready() {
-    [ -f "$DB_PATH" ] || return 1
-    sqlite3 "$DB_PATH" "SELECT 1 FROM inbounds LIMIT 1;" >/dev/null 2>&1 || return 1
+    [ -f "$DB_PATH" ] || { err "Database not found at ${DB_PATH}"; return 1; }
+    sqlite3 "$DB_PATH" "SELECT 1 FROM inbounds LIMIT 1;" >/dev/null 2>&1 || {
+        err "Cannot read the inbounds table in ${DB_PATH}"; return 1; }
     return 0
 }
 
@@ -603,15 +668,16 @@ sub_is_separate() {
 
 pick_sub_port() {
     local p limit
-    p=$((${SITE_PORT:-8081} + 1))
+    p=$((SITE_PORT + 1))
     limit=$((p + 300))
     refresh_taken_ports 2>/dev/null || true
     while [ "$p" -le "$limit" ]; do
-        [ "$p" = "${SITE_PORT:-8081}" ] && { p=$((p + 1)); continue; }
+        [ "$p" = "$SITE_PORT" ] && { p=$((p + 1)); continue; }
         if [ "$p" = "${SUB_BIND_PORT:-}" ] && ! port_busy "$p"; then SUB_BIND_PORT="$p"; return 0; fi
         if [ -z "${TAKEN_PORTS[$p]:-}" ] && ! port_busy "$p"; then SUB_BIND_PORT="$p"; return 0; fi
         p=$((p + 1))
     done
+    err "No free loopback port for the subscription vhost"
     return 1
 }
 
@@ -620,22 +686,28 @@ configure_subscription() {
     spath=$(sub_path)
     if ! sub_enabled; then
         SUB_ON_SITE="no"
+        warn "Subscription is disabled in the panel - not published on the domain"
+        warn "Enable it in the panel, then run option 2 to republish"
         return 0
     fi
     if [ -z "$spath" ]; then
         spath="/sub"
         set_setting subPath "${spath}/"
+        warn "Subscription had no path - set to ${spath}/"
     fi
     if [ "$spath" = "$(panel_path)" ]; then
         SUB_ON_SITE="no"
+        err "Subscription path equals the panel path - cannot publish both"
         return 0
     fi
     [ -n "$SUB_DOMAIN" ] || SUB_DOMAIN="$DOMAIN"
     if [ "$SUB_DOMAIN" != "$DOMAIN" ]; then
         SUB_CERT=""; SUB_KEY=""
         if resolve_cert "$SUB_DOMAIN" SUB_CERT SUB_KEY; then
+            cert_expired "$SUB_CERT" && warn "Certificate for ${SUB_DOMAIN} is EXPIRED - renew it"
             pick_sub_port || { SUB_DOMAIN="$DOMAIN"; SUB_CERT=""; SUB_KEY=""; }
         else
+            warn "No certificate for ${SUB_DOMAIN} - subscription falls back to ${DOMAIN}"
             SUB_DOMAIN="$DOMAIN"; SUB_CERT=""; SUB_KEY=""; SUB_BIND_PORT=""
         fi
     fi
@@ -645,6 +717,7 @@ configure_subscription() {
     if [ -n "$jpath" ] && [ "$jpath" != "$spath" ]; then
         set_setting subJsonURI "https://${SUB_DOMAIN}${jpath}/"
     fi
+    ok "Subscription URL: https://${SUB_DOMAIN}${spath}/"
     return 0
 }
 
@@ -653,6 +726,7 @@ ensure_panel_path() {
     if [ -z "$p" ]; then
         p="/panel$(rand_str 6)"
         set_setting webBasePath "${p}/"
+        warn "Panel had no base path. It is now: ${p}/"
     fi
     printf '%s\n' "$p"
 }
@@ -701,6 +775,7 @@ alloc_port() {
         fi
         p=$((p + 1))
     done
+    err "No free internal port between ${MIN_PORT} and ${MAX_PORT}."
     return 1
 }
 
@@ -768,18 +843,24 @@ v_domain() {
     if [[ "$x" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
         printf '%s\n' "$x"; return 0
     fi
+    err "Enter a valid domain, e.g. cdn.example.com"
     return 1
 }
 
 v_yn() {
     local x; x=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
     case "$x" in y|yes) echo yes; return 0 ;; n|no|"") echo no; return 0 ;; esac
+    err "Answer y or n."
     return 1
 }
+
+
+
 
 v_path() {
     local x="${1:-}"
     [ -f "$x" ] && { printf '%s\n' "$x"; return 0; }
+    err "File not found: ${x:-<empty>}"
     return 1
 }
 
@@ -817,7 +898,7 @@ parse_selection() {
         fi
         toks=()
         read -ra toks <<< "$raw" || true
-        if [ "${#toks[@]}" -eq 0 ]; then continue; fi
+        if [ "${#toks[@]}" -eq 0 ]; then err "Enter at least one number, or 'all'."; continue; fi
         bad=""; SEL_IDX=(); seen=()
         for tok in "${toks[@]}"; do
             if ! [[ "$tok" =~ ^[0-9]+$ ]] || [ "$tok" -lt 1 ] || [ "$tok" -gt "$total" ]; then bad="$tok"; break; fi
@@ -825,7 +906,7 @@ parse_selection() {
             seen[$tok]=1
             SEL_IDX+=("$tok")
         done
-        if [ -n "$bad" ]; then continue; fi
+        if [ -n "$bad" ]; then err "'${bad}' is out of range (1-${total})."; continue; fi
         return 0
     done
 }
@@ -838,15 +919,18 @@ validate_selection() {
         s="${RI_SNI[$((idx - 1))]}"
         rem="${RI_REMARK[$((idx - 1))]}"
         if [ -z "$s" ]; then
+            warn "Skipping '${rem}': no Reality serverName, cannot be routed by SNI."
             continue
         fi
         if [ -n "${owner[$s]:-}" ]; then
+            err "SNI '${s}' is shared by '${owner[$s]}' and '${rem}'. Give each inbound a unique serverName."
             return 1
         fi
         owner[$s]="$rem"
         keep+=("$idx")
     done
     if [ "${#keep[@]}" -eq 0 ]; then
+        err "None of the selected inbounds have a serverName."
         return 1
     fi
     SEL_IDX=("${keep[@]}")
@@ -954,18 +1038,20 @@ NGCONF
 
 install_nginx() {
     if ! have nginx; then
+        info "Installing nginx..."
         if [ "$(pkg_mgr)" = "apt" ]; then
             install_pkgs nginx libnginx-mod-stream || true
         else
             install_pkgs nginx nginx-mod-stream || install_pkgs nginx || true
         fi
-        have nginx || return 1
+        have nginx || { err "nginx installation failed."; return 1; }
     fi
     sync_nginx_paths
     if [ ! -f "$NGINX_CONF" ]; then
+        warn "${NGINX_CONF} missing - creating a clean configuration."
         write_minimal_nginx_conf
     fi
-    [ -f "$NGINX_CONF" ] || return 1
+    [ -f "$NGINX_CONF" ] || { err "Cannot create ${NGINX_CONF}."; return 1; }
 
     local st so
     st=$(stream_state)
@@ -983,6 +1069,7 @@ install_nginx() {
     fi
     if [ -z "$so" ]; then
         [ "$(stream_state)" = "static" ] && { systemctl enable "$NGINX_SERVICE" >/dev/null 2>&1 || true; return 0; }
+        err "ngx_stream_module.so not found. Install your distribution's nginx stream module."
         return 1
     fi
     if ! stream_module_loaded; then
@@ -1085,7 +1172,7 @@ tune_nginx_main() {
     elif [ "$mem" -lt 8192 ]; then
         wconn=32768; wfile=500000
     else
-        wconn=65535; wfile=500000
+        wconn=65535; wfile=1000000
     fi
     if ! grep -qE '^[[:space:]]*worker_rlimit_nofile' "$NGINX_CONF"; then
         { printf 'worker_rlimit_nofile %s;\n' "$wfile"; cat "$NGINX_CONF"; } > "$tmp"
@@ -1105,6 +1192,7 @@ tune_nginx_main() {
     strip_owned_directives
     ensure_confd_included
     cat > "$NGINX_TUNE" <<'TUNE'
+# reality443-managed
 sendfile on;
 tcp_nopush on;
 tcp_nodelay on;
@@ -1120,6 +1208,7 @@ server_names_hash_bucket_size 128;
 server_tokens off;
 access_log off;
 TUNE
+    ok "nginx core tuned for high connection count"
 }
 
 ram_mb() {
@@ -1137,7 +1226,7 @@ apply_sysctl() {
     elif [ "$mem" -lt 8192 ]; then
         sockmax=33554432;  rmem_hi=33554432;  ct=262144;  fmax=500000;  nl_backlog=65536
     else
-        sockmax=67108864;  rmem_hi=67108864;  ct=1048576; fmax=500000; nl_backlog=250000
+        sockmax=67108864;  rmem_hi=67108864;  ct=1048576; fmax=1000000; nl_backlog=250000
     fi
     cat > "$SYSCTL_FILE" <<SYSCTL
 net.core.default_qdisc = fq
@@ -1169,12 +1258,18 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.netfilter.nf_conntrack_max = ${ct}
 fs.file-max = ${fmax}
-fs.nr_open = 1048576
 vm.swappiness = 10
 SYSCTL
     modprobe tcp_bbr >/dev/null 2>&1 || true
     printf 'tcp_bbr\n' > /etc/modules-load.d/reality443.conf 2>/dev/null || true
     sysctl --system >/dev/null 2>&1 || true
+    local cc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+    if [ "$cc" = "bbr" ]; then
+        ok "Kernel tuned for ${mem}MB RAM (BBR + fq + sized buffers)"
+    else
+        warn "Kernel tuned for ${mem}MB RAM, but congestion control is '${cc}'"
+    fi
 }
 
 apply_limits() {
@@ -1182,7 +1277,7 @@ apply_limits() {
     mem=$(ram_mb)
     if [ "$mem" -lt 2048 ]; then lim=200000
     elif [ "$mem" -lt 8192 ]; then lim=500000
-    else lim=500000; fi
+    else lim=1000000; fi
     cat > "$LIMITS_FILE" <<LIM
 * soft nofile ${lim}
 * hard nofile ${lim}
@@ -1208,6 +1303,7 @@ DefaultLimitNOFILE=${lim}
 DefaultLimitNPROC=${lim}
 SYSD
     systemctl daemon-reload >/dev/null 2>&1 || true
+    ok "File descriptor limits set to ${lim} (${mem}MB RAM)"
 }
 
 write_stream_conf() {
@@ -1217,7 +1313,7 @@ write_stream_conf() {
     tmp=$(mktemp)
 
     if [ -f "$SITE_CONF" ] && [ -n "$DOMAIN" ] && [ -n "$SITE_CERT" ]; then
-        site_be="127.0.0.1:${SITE_PORT:-8081}"
+        site_be="127.0.0.1:${SITE_PORT}"
         default_backend="$site_be"
     fi
     if [ -z "$default_backend" ]; then
@@ -1229,6 +1325,7 @@ write_stream_conf() {
         done
     fi
     if [ -z "$default_backend" ]; then
+        err "No routed inbound and no site - nothing to serve on 443."
         rm -f "$tmp"; return 1
     fi
 
@@ -1255,8 +1352,10 @@ write_stream_conf() {
             done
         fi
     done
+    [ -n "$dupes" ] && warn "Duplicate SNI names skipped to keep nginx valid."
 
     {
+        echo "# reality443-managed v${SCRIPT_VERSION}"
         echo "map \$ssl_preread_server_name \$reality443_upstream {"
         echo "    default ${default_backend};"
         [ "${#map_lines[@]}" -gt 0 ] && printf '%s\n' "${map_lines[@]}"
@@ -1278,6 +1377,7 @@ write_stream_conf() {
 
     mkdir -p "$(dirname "$STREAM_FILE")" 2>/dev/null || true
     if ! mv "$tmp" "$STREAM_FILE" 2>/dev/null; then
+        err "Could not write ${STREAM_FILE}"
         rm -f "$tmp"; return 1
     fi
     unset -f add_map_entry
@@ -1324,6 +1424,7 @@ hook_stream_include() {
     local hit; hit=$(find_toplevel_stream "$NGINX_CONF" || true)
     if [ -n "$hit" ]; then
         if insert_include_into_stream "$NGINX_CONF" "$hit"; then return 0; fi
+        err "Could not extend the existing stream block. Add manually: include ${STREAM_FILE};"
         return 1
     fi
     {
@@ -1337,8 +1438,8 @@ hook_stream_include() {
         echo "    include ${STREAM_FILE};"
         echo "}"
         echo "$MARK_END"
-    } >> "$NGINX_CONF" 2>/dev/null || return 1
-    grep -qF "$MARK_BEGIN" "$NGINX_CONF" || return 1
+    } >> "$NGINX_CONF" 2>/dev/null || { err "Could not write to ${NGINX_CONF}"; return 1; }
+    grep -qF "$MARK_BEGIN" "$NGINX_CONF" || { err "Stream block did not persist."; return 1; }
     return 0
 }
 
@@ -1393,8 +1494,12 @@ apply_nginx() {
         if systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null; then
             return 0
         fi
+        err "nginx config is valid but the service failed to start."
+        systemctl status "$NGINX_SERVICE" --no-pager 2>&1 | tail -n 12 >&2
         return 1
     fi
+    err "nginx config test failed."
+    sed -n '1,25p' /tmp/r443.nginx.err >&2
     [ -n "$backup_dir" ] && restore_nginx_from "$backup_dir"
     return 1
 }
@@ -1422,8 +1527,10 @@ start_xui_and_wait() {
     systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
     if [ "$#" -gt 0 ] && wait_for_ports "$@"; then return 0; fi
     if systemctl is-active --quiet "$XUI_SERVICE"; then
+        [ "$#" -gt 0 ] && warn "x-ui is running but has not bound every port yet."
         return 0
     fi
+    err "x-ui failed to start - check: systemctl status ${XUI_SERVICE}"
     return 1
 }
 
@@ -1501,7 +1608,7 @@ find_key_for_cert() {
         [ "$k" = "$c" ] && continue
         is_key_file "$k" || continue
         key_matches_cert "$c" "$k" && { printf '%s' "$k"; return 0; }
-    done < <(find "$d" -maxdepth 1 -type f \( -name '*.key' -o -name '*.pem' -o -name '*.txt' \) 2>/dev/null | head -50)
+    done < <(find "$d" -maxdepth 1 -type f \( -name '*.key' -o -name '*.pem' -o -name '*.txt' \) 2>/dev/null | head -40)
     return 1
 }
 
@@ -1519,7 +1626,7 @@ find_cert_pairs() {
             dom=$(cert_primary_name "$f")
             [ -n "$dom" ] || dom=$(basename "$(dirname "$f")")
             printf '%s|%s|%s\n' "$dom" "$f" "$key"
-        done < <(find "$base" -maxdepth "$depth" -type f \( -name '*.pem' -o -name '*.crt' -o -name '*.cer' -o -name '*.fullchain' \) 2>/dev/null | head -500)
+        done < <(find "$base" -maxdepth "$depth" -type f \( -name '*.pem' -o -name '*.crt' -o -name '*.cer' -o -name '*.fullchain' \) 2>/dev/null | head -80)
     done | awk -F'|' '!seen[$2]++'
 }
 
@@ -1571,9 +1678,11 @@ list_found_certs() {
     local -a pairs=()
     mapfile -t pairs < <(find_cert_pairs)
     if [ "${#pairs[@]}" -eq 0 ]; then
+        warn "No usable certificate/key pair found under: ${CERT_SEARCH_DIRS}"
         return 1
     fi
     local k pd pc
+    step "Certificates found on this server"
     for k in "${!pairs[@]}"; do
         pd=$(printf '%s' "${pairs[$k]}" | cut -d'|' -f1)
         pc=$(printf '%s' "${pairs[$k]}" | cut -d'|' -f2)
@@ -1587,8 +1696,10 @@ resolve_cert() {
     local dom="$1" cvar="$2" kvar="$3" pick c1 c2
     local -a pairs=()
     if auto_select_cert_into "$dom" "$cvar" "$kvar"; then
+        ok "Certificate matched for ${dom}"
         return 0
     fi
+    err "No certificate covering ${dom} was auto-detected"
     mapfile -t pairs < <(find_cert_pairs)
     if [ "${#pairs[@]}" -gt 0 ]; then
         list_found_certs
@@ -1606,8 +1717,11 @@ resolve_cert() {
                 c2=$(printf '%s' "${pairs[$((pick - 1))]}" | cut -d'|' -f3)
                 printf -v "$cvar" '%s' "$c1"
                 printf -v "$kvar" '%s' "$c2"
+                cert_covers_domain "$c1" "$dom" || warn "That certificate does not list ${dom} - browsers will warn"
+                ok "Using ${c1}"
                 return 0
             fi
+            err "Pick a number, 0 for manual paths, or s to skip."
         done
     fi
     while true; do
@@ -1615,30 +1729,36 @@ resolve_cert() {
         IFS= read -r c1 || c1=""
         [ -z "$c1" ] && return 1
         if [ ! -f "$c1" ] || ! is_cert_file "$c1"; then
+            err "Not a valid certificate: ${c1}"
             continue
         fi
         printf '%s  Full path to private key%s: ' "$(next_c)" "$R"
         IFS= read -r c2 || c2=""
         if [ ! -f "$c2" ] || ! is_key_file "$c2"; then
+            err "Not a valid private key: ${c2}"
             continue
         fi
         if ! key_matches_cert "$c1" "$c2"; then
+            err "This key does not belong to that certificate"
             continue
         fi
         printf -v "$cvar" '%s' "$c1"
         printf -v "$kvar" '%s' "$c2"
+        ok "Using ${c1}"
         return 0
     done
 }
 
+
 pick_site_port() {
-    local p="${SITE_PORT:-8081}" limit=$((p + 300))
+    local p="${SITE_PORT:-8081}" limit=$((SITE_PORT + 300))
     refresh_taken_ports 2>/dev/null || true
     while [ "$p" -le "$limit" ]; do
         if [ "$p" = "${SITE_BIND_PORT:-}" ] && ! port_busy "$p"; then SITE_PORT="$p"; return 0; fi
         if [ -z "${TAKEN_PORTS[$p]:-}" ] && ! port_busy "$p"; then SITE_PORT="$p"; return 0; fi
         p=$((p + 1))
     done
+    err "No free loopback port for the camouflage site."
     return 1
 }
 
@@ -1648,10 +1768,12 @@ copy_site_files() {
     mkdir -p "$SITE_ROOT"
     srcdir=$(dirname "$src")
     if [ "$srcdir" = "$SITE_ROOT" ]; then
+        ok "Site files already in place"
         return 0
     fi
     case "$srcdir" in
         /|/root|/home|/etc|/usr|/var|/opt|/tmp|/srv|/boot)
+            warn "Source sits in a system directory - copying only index.html"
             cp -f "$src" "${SITE_ROOT}/index.html" || return 1
             return 0 ;;
     esac
@@ -1659,13 +1781,17 @@ copy_site_files() {
     sz=$(du -sm "$srcdir" 2>/dev/null | awk '{print $1}')
     [ -n "$sz" ] || sz=0
     if [ "$n" -gt 20000 ] || [ "$sz" -gt 500 ]; then
+        warn "Source folder is large (${n} files, ${sz}MB) - copying only index.html"
         cp -f "$src" "${SITE_ROOT}/index.html" || return 1
         return 0
     fi
+    info "Copying ${n} file(s) from ${srcdir}"
     if ! timeout 120 cp -a "${srcdir}/." "$SITE_ROOT"/ 2>/dev/null; then
+        warn "Bulk copy failed or timed out - falling back to index.html only"
         cp -f "$src" "${SITE_ROOT}/index.html" || return 1
     fi
     [ -f "${SITE_ROOT}/index.html" ] || cp -f "$src" "${SITE_ROOT}/index.html"
+    ok "Copied site files to ${SITE_ROOT}"
     return 0
 }
 
@@ -1685,13 +1811,17 @@ setup_site_content() {
     if [ -n "${SITE_SRC_ARG:-}" ]; then
         if [ -f "$SITE_SRC_ARG" ]; then
             src="$SITE_SRC_ARG"
+            info "Using site file supplied on the command line"
+        else
+            warn "Supplied site file not found: ${SITE_SRC_ARG}"
         fi
     fi
     [ -n "$src" ] || src=$(find_user_index || true)
     if [ -n "$src" ]; then
-        copy_site_files "$src" || generate_default_site
+        copy_site_files "$src" || { warn "Falling back to built-in page"; generate_default_site; }
     else
         generate_default_site
+        ok "Built-in camouflage page generated"
     fi
     chown -R www-data:www-data "$SITE_ROOT" 2>/dev/null || chown -R nginx:nginx "$SITE_ROOT" 2>/dev/null || true
     chmod -R a+rX "$SITE_ROOT" 2>/dev/null || true
@@ -1741,6 +1871,7 @@ disable_stock_default_site() {
         grep -qE 'listen[^;]*default_server' "$f" 2>/dev/null || continue
         base=$(basename "$f")
         mv -f "$f" "${DISABLED_DIR}/${base}"
+        info "Moved conflicting default site: ${f}"
     done
     for f in "${NGINX_DIR}"/sites-enabled/*.reality443-disabled "${NGINX_DIR}"/conf.d/*.reality443-disabled; do
         [ -e "$f" ] || continue
@@ -1815,6 +1946,7 @@ write_site_conf() {
     local tmp ppath pport pscheme
     tmp=$(mktemp)
     {
+        echo "# reality443-managed v${SCRIPT_VERSION}"
         echo "server {"
         echo "    listen 80 default_server backlog=65535;"
         has_ipv6 && echo "    listen [::]:80 default_server backlog=65535;"
@@ -1832,7 +1964,7 @@ write_site_conf() {
         if [ -n "$DOMAIN" ] && [ -n "$SITE_CERT" ] && [ -n "$SITE_KEY" ]; then
             echo ""
             echo "server {"
-            emit_listen_ssl "${SITE_PORT:-8081}"
+            emit_listen_ssl "$SITE_PORT"
             echo "    server_name ${DOMAIN};"
             emit_tls_common "$SITE_CERT" "$SITE_KEY"
             if [ "$PANEL_ON_SITE" = "yes" ]; then
@@ -1881,6 +2013,7 @@ write_site_conf() {
     } > "$tmp"
     mkdir -p "$(dirname "$SITE_CONF")"
     if ! mv "$tmp" "$SITE_CONF" 2>/dev/null; then
+        err "Could not write ${SITE_CONF}"
         rm -f "$tmp"; return 1
     fi
     return 0
@@ -1898,6 +2031,7 @@ apply_site() {
     write_stream_conf || return 1
     local bdir; bdir=$(backup_now)
     if apply_nginx "$bdir"; then return 0; fi
+    err "Site configuration rolled back."
     rm -f "$SITE_CONF"
     SITE_MODE="none"; save_state
     load_inbounds; write_stream_conf >/dev/null 2>&1 || true
@@ -1951,12 +2085,18 @@ log INFO "watchdog started pid $$"
 cooldown=0
 while true; do
     if ! systemctl is-active --quiet "$NGINX_SERVICE"; then
+        log WARN "nginx inactive - starting"
         systemctl start "$NGINX_SERVICE" >/dev/null 2>&1
     fi
     if ! systemctl is-active --quiet "$XUI_SERVICE"; then
+        log WARN "x-ui inactive - starting"
         systemctl start "$XUI_SERVICE" >/dev/null 2>&1
     fi
+    if [ -f "$STREAM_FILE" ] && ! grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null; then
+        log ERROR "stream include missing from nginx.conf"
+    fi
     if [ -f "$STREAM_FILE" ] && ! port_busy 443; then
+        log ERROR "port 443 not bound - restarting nginx"
         systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1
     fi
     if [ "$cooldown" -gt 0 ]; then
@@ -1968,6 +2108,7 @@ while true; do
             port_busy "$p" || miss=$((miss + 1))
         done < <(jq -r '.[]' "$ROUTED_FILE" 2>/dev/null)
         if [ "$miss" -gt 0 ]; then
+            log ERROR "$miss backend port(s) down - restarting x-ui"
             systemctl restart "$XUI_SERVICE" >/dev/null 2>&1
             cooldown=10
         fi
@@ -1977,6 +2118,7 @@ done
 WDBODY
     chmod 755 "$WATCHDOG_PATH"
     if ! bash -n "$WATCHDOG_PATH" 2>/dev/null; then
+        err "Generated watchdog has a syntax error"
         return 1
     fi
     return 0
@@ -2020,6 +2162,9 @@ UNIT
         systemctl is-active --quiet "${GUARD_NAME}.service" && return 0
         sleep 1
     done
+    err "Watchdog failed to start:"
+    systemctl status "${GUARD_NAME}.service" --no-pager 2>&1 | tail -n 10 >&2
+    journalctl -u "${GUARD_NAME}.service" -n 12 --no-pager 2>&1 | tail -n 12 >&2
     return 1
 }
 
@@ -2044,6 +2189,7 @@ setup_firewall_auto() {
         install_pkgs ufw || true
     fi
     if ! have ufw; then
+        warn "ufw not available - firewall step skipped"
         return 1
     fi
 
@@ -2052,9 +2198,11 @@ setup_firewall_auto() {
         fw_allow "$sp" "SSH" || failed=$((failed + 1))
     done
     if [ "$failed" -gt 0 ]; then
+        err "SSH rule failed - firewall left untouched to avoid lockout"
         return 1
     fi
     if ! ufw show added 2>/dev/null | grep -qE "allow[[:space:]]+${sports[0]}"; then
+        err "SSH rule did not register - firewall left untouched"
         return 1
     fi
 
@@ -2069,8 +2217,10 @@ setup_firewall_auto() {
         ufw allow "${sp}/udp" >/dev/null 2>&1 || true
         n=$((n + 1))
     done
+    ok "Opened ${n} port(s) from the x-ui database plus 80 and 443 (tcp+udp)"
 
     if ! ufw --force enable >/dev/null 2>&1; then
+        err "Could not enable ufw"
         return 1
     fi
     local okssh=0
@@ -2079,29 +2229,33 @@ setup_firewall_auto() {
     done
     if [ "$okssh" -eq 0 ]; then
         ufw disable >/dev/null 2>&1 || true
+        err "SSH port not open after enabling - firewall disabled again for safety"
         return 1
     fi
     if ! ufw status 2>/dev/null | grep -qE '^443/tcp'; then
         ufw disable >/dev/null 2>&1 || true
+        err "Port 443 not open after enabling - firewall disabled again for safety"
         return 1
     fi
+    ok "Firewall active - SSH ${sports[*]}, 443, and every inbound port are open"
     return 0
 }
+
 
 verify_live() {
     local fails=0 eff i p
     eff=$(nginx -T 2>/dev/null || true)
-    printf '%s' "$eff" | grep -q 'ssl_preread_server_name' || fails=$((fails + 1))
+    printf '%s' "$eff" | grep -q 'ssl_preread_server_name' || { err "stream map missing from effective nginx config"; fails=$((fails + 1)); }
     if port_busy 443; then
         local o; o=$(port_owner 443)
-        [ "$o" = "nginx" ] || [ -z "$o" ] || fails=$((fails + 1))
+        [ "$o" = "nginx" ] || [ -z "$o" ] || { err "port 443 is held by '${o}', not nginx"; fails=$((fails + 1)); }
     else
-        fails=$((fails + 1))
+        err "nothing is listening on port 443"; fails=$((fails + 1))
     fi
     for ((i = 0; i < ${#RI_ID[@]}; i++)); do
         is_routable_listen "${RI_LISTEN[$i]}" || continue
         p="${RI_PORT[$i]}"
-        port_busy "$p" || fails=$((fails + 1))
+        port_busy "$p" || { err "${RI_REMARK[$i]} not listening on ${p}"; fails=$((fails + 1)); }
     done
     [ "$fails" -eq 0 ] && return 0
     return 1
@@ -2112,8 +2266,22 @@ success_report() {
     echo
     if [ "$issues" -eq 0 ]; then
         printf '%s ✓ Installation completed successfully %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Configuration applied successfully %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Kernel and socket tuning applied %s\n' "$BG_OK" "$R"
+        printf '%s ✓ 443 routing started successfully %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Service enabled successfully %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Auto-start enabled %s\n' "$BG_OK" "$R"
+        printf '%s ✓ Automatic reconnect configured %s\n' "$BG_OK" "$R"
     else
         printf '%s ✗ INSTALLATION INCOMPLETE - %s check(s) failed %s\n' "$BG_ERR" "$issues" "$R"
+        printf '%s ! The server is NOT serving traffic correctly yet %s\n' "$BG_WARN" "$R"
+        printf '%s ! Fix the lines marked with a cross above, then run option 1 again %s\n' "$BG_WARN" "$R"
+        echo
+        printf '%s  Useful commands:%s\n' "$C_SLATE" "$R"
+        printf '%s    nginx -t%s\n' "$C_STEEL" "$R"
+        printf '%s    systemctl status nginx %s --no-pager%s\n' "$C_STEEL" "$XUI_SERVICE" "$R"
+        printf '%s    journalctl -u %s -n 40 --no-pager%s\n' "$C_STEEL" "$XUI_SERVICE" "$R"
+        printf '%s    ss -ltnp | grep -E ":443|:80"%s\n' "$C_STEEL" "$R"
     fi
     echo
     printf '%s  Domain      %s%s\n' "$C_TURQ" "$DOMAIN" "$R"
@@ -2128,6 +2296,12 @@ success_report() {
     printf '%s  Watchdog    %s%s\n' "$C_LILAC" "$(systemctl is-active "${GUARD_NAME}.service" 2>/dev/null || echo inactive)" "$R"
     printf '%s  Firewall    %s%s\n' "$C_ROSE" "$(ufw status 2>/dev/null | head -1 | sed 's/Status: //' || echo 'not installed')" "$R"
     echo
+    if [ "$SUB_DOMAIN" != "$DOMAIN" ]; then
+        printf '%s  Point %s, %s and every Reality SNI at this server IP.%s\n' "$C_SLATE" "$DOMAIN" "$SUB_DOMAIN" "$R"
+    else
+        printf '%s  Point %s and every Reality SNI at this server IP.%s\n' "$C_SLATE" "$DOMAIN" "$R"
+    fi
+    echo
 }
 
 do_setup() {
@@ -2139,6 +2313,7 @@ do_setup() {
     refresh_taken_ports
 
     if [ "${#RI_ID[@]}" -eq 0 ]; then
+        err "No Reality inbounds found in ${DB_PATH}"
         pause; return 0
     fi
 
@@ -2155,14 +2330,29 @@ do_setup() {
     clear
     header
     step "FULL AUTOMATIC INSTALLATION"
+    line_c 0 "  1/10  nginx and stream module"
+    line_c 1 "  2/10  kernel and socket tuning"
+    line_c 2 "  3/10  file descriptor limits"
+    line_c 3 "  4/10  nginx core tuning"
+    line_c 4 "  5/10  inbound consolidation"
+    line_c 5 "  6/10  TLS certificate"
+    line_c 6 "  7/10  camouflage site + panel"
+    line_c 7 "  8/10  443 SNI routing"
+    line_c 8 "  9/10  firewall"
+    line_c 9 " 10/10  watchdog and auto-start"
+    echo
 
     local bdir failed_steps=0
 
+    step "[1/10] nginx"
     if ! install_nginx; then
+        err "nginx could not be installed - cannot continue"
         pause; return 0
     fi
     sync_nginx_paths
+    ok "nginx ready with stream support"
     if ! preflight_443; then
+        err "Port 443 is not available - fix the conflict above and run again"
         pause; return 0
     fi
 
@@ -2170,10 +2360,16 @@ do_setup() {
     save_original_ports
     save_state
 
+    step "[2/10] kernel tuning"
     apply_sysctl
+
+    step "[3/10] limits"
     apply_limits
+
+    step "[4/10] nginx core"
     tune_nginx_main
 
+    step "[5/10] inbound consolidation"
     local idx i cur
     PLAN_PORT=()
     for idx in "${SEL_IDX[@]}"; do
@@ -2183,6 +2379,7 @@ do_setup() {
             PLAN_PORT[$i]="$cur"
         else
             if ! alloc_port "$cur"; then
+                err "Could not allocate an internal port"
                 pause; return 0
             fi
             PLAN_PORT[$i]="$ALLOC_PORT"
@@ -2199,13 +2396,17 @@ do_setup() {
         fi
         set_inbound_host "${RI_ID[$i]}" "$DOMAIN" "${RI_REMARK[$i]:-reality}" 443
         wait_ports+=("${PLAN_PORT[$i]}")
+        ok "${RI_REMARK[$i]:-inbound} -> $(backend_ip "${RI_LISTEN[$i]}"):${PLAN_PORT[$i]}"
     done
     save_routed_ports "${wait_ports[@]}"
 
+    step "[6/10] certificate"
     SITE_CERT=""; SITE_KEY=""
     if resolve_cert "$DOMAIN" SITE_CERT SITE_KEY; then
+        cert_expired "$SITE_CERT" && warn "Certificate for ${DOMAIN} is EXPIRED - renew it"
         SITE_MODE="local"; PANEL_ON_SITE="yes"; SUB_ON_SITE="yes"
     else
+        warn "No certificate for ${DOMAIN} - site will be HTTP only"
         SITE_MODE="local"; PANEL_ON_SITE="no"; SUB_ON_SITE="no"
         failed_steps=$((failed_steps + 1))
     fi
@@ -2216,28 +2417,41 @@ do_setup() {
     save_state
     start_xui_and_wait "${wait_ports[@]}" || true
 
+    step "[7/10] camouflage site"
     setup_site_content
     if [ -n "$SITE_CERT" ]; then
         pick_site_port || true
-        SITE_BIND_PORT="${SITE_PORT:-8081}"
+        SITE_BIND_PORT="$SITE_PORT"
     fi
     save_state
     disable_stock_default_site
-    if ! write_site_conf; then
+    if write_site_conf; then
+        ok "Site configuration written"
+    else
+        warn "Site configuration failed"
         failed_steps=$((failed_steps + 1))
     fi
 
+    step "[8/10] 443 routing"
     load_inbounds
     if ! write_stream_conf || ! hook_stream_include; then
+        err "nginx routing could not be built"
         pause; return 0
     fi
     if ! apply_nginx "$bdir"; then
+        err "nginx rolled back - database is consolidated, fix nginx then run Sync"
         pause; return 0
     fi
+    ok "nginx reloaded - SNI routing live on 443"
 
+    step "[9/10] firewall"
     setup_firewall_auto || failed_steps=$((failed_steps + 1))
 
-    if ! install_guard_service; then
+    step "[10/10] watchdog"
+    if install_guard_service; then
+        ok "Watchdog running, auto-start enabled"
+    else
+        warn "Watchdog not active - use: Services and Watchdog > Install / Repair Watchdog"
         failed_steps=$((failed_steps + 1))
     fi
 
@@ -2250,6 +2464,7 @@ do_sync() {
     header
     db_ready || { pause; return 0; }
     if [ ! -f "$STREAM_FILE" ]; then
+        err "Nothing installed yet. Run Setup first."
         pause; return 0
     fi
     detect_host_mechanism
@@ -2273,6 +2488,7 @@ do_sync() {
     fi
 
     if [ "${#pending[@]}" -gt 0 ]; then
+        step "Unrouted inbounds"
         show_table
         parse_selection
         if validate_selection; then
@@ -2289,22 +2505,27 @@ do_sync() {
                     xsql "UPDATE inbounds SET listen='127.0.0.1', port=${p} WHERE id=${RI_ID[$i]};" || true
                 fi
                 [ -n "$DOMAIN" ] && set_inbound_host "${RI_ID[$i]}" "$DOMAIN" "${RI_REMARK[$i]:-reality}" 443
+                ok "${RI_REMARK[$i]} -> $(backend_ip "${RI_LISTEN[$i]}"):${p}"
                 wait_ports+=("$p")
             done
             save_routed_ports "${wait_ports[@]}"
             start_xui_and_wait "${wait_ports[@]}" || true
             load_inbounds
         fi
+    else
+        ok "All Reality inbounds are already routed - regenerating the map"
     fi
 
     local bdir; bdir=$(backup_now)
     if ! write_stream_conf || ! hook_stream_include; then
+        err "Could not rebuild the nginx map."
         pause; return 0
     fi
-    apply_nginx "$bdir"
-    verify_live || true
+    apply_nginx "$bdir" && ok "Routing map rebuilt and reloaded"
+    verify_live || warn "Verification reported issues - see Diagnose."
     pause
 }
+
 
 ssh_ports() {
     {
@@ -2320,10 +2541,32 @@ ssh_ports() {
 fw_allow() {
     local port="$1" label="$2" proto="${3:-tcp}" out
     if out=$(ufw allow "${port}/${proto}" 2>&1); then
+        log_write OK "ufw allow ${port}/${proto} (${label})"
         return 0
     fi
+    err "Failed to allow ${port}/${proto} (${label}): ${out}"
     return 1
 }
+
+
+
+
+
+colorize_log() {
+    local ln ts lvl msg
+    while IFS= read -r ln; do
+        ts="${ln%%|*}"
+        lvl="${ln#*|}"; lvl="${lvl%%|*}"
+        msg="${ln#*|*|}"
+        case "$lvl" in
+            OK)    printf '%s%s%s %s ✓ %s %s\n' "$C_SLATE" "$ts" "$R" "$BG_OK" "$msg" "$R" ;;
+            ERROR) printf '%s%s%s %s ✗ %s %s\n' "$C_SLATE" "$ts" "$R" "$BG_ERR" "$msg" "$R" ;;
+            WARN)  printf '%s%s%s %s ! %s %s\n' "$C_SLATE" "$ts" "$R" "$BG_WARN" "$msg" "$R" ;;
+            *)     printf '%s%s%s %s  %s%s\n' "$C_SLATE" "$ts" "$R" "$C_STEEL" "$msg" "$R" ;;
+        esac
+    done
+}
+
 
 diagnose() {
     header
@@ -2347,6 +2590,7 @@ diagnose() {
     printf '%s  congestion        %s%s\n' "$C_TURQ" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo ?)" "$R"
     printf '%s  qdisc             %s%s\n' "$C_MINT" "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo ?)" "$R"
     printf '%s  somaxconn         %s%s\n' "$C_GOLD" "$(sysctl -n net.core.somaxconn 2>/dev/null || echo ?)" "$R"
+    printf '%s  nginx nofile      %s%s\n' "$C_LILAC" "$(grep -i 'open files' /proc/"$(pgrep -o nginx 2>/dev/null || echo 1)"/limits 2>/dev/null | awk '{print $4}' || echo ?)" "$R"
 
     step "Services"
     printf '%s  x-ui              %s%s\n' "$C_TURQ" "$(systemctl is-active "$XUI_SERVICE" 2>/dev/null || echo inactive)" "$R"
@@ -2356,6 +2600,7 @@ diagnose() {
     step "Live checks"
     if ! nginx -t 2>/tmp/r443.diag.err; then
         err "nginx config test FAILED"
+        sed -n '1,10p' /tmp/r443.diag.err >&2
     else
         ok "nginx config test passed"
     fi
@@ -2369,13 +2614,26 @@ diagnose() {
             err "${RI_REMARK[$i]} NOT listening on ${RI_PORT[$i]}"
         fi
     done
+    if [ -n "$DOMAIN" ] && [ -n "$SITE_CERT" ] && port_busy "$SITE_PORT"; then
+        ok "camouflage site listening on 127.0.0.1:${SITE_PORT}"
+    fi
     pause
 }
 
+
 do_uninstall() {
     header
+    step "Full uninstall"
+    line_c 0 "  - stop and disable the watchdog service"
+    line_c 1 "  - remove systemd units and drop-ins"
+    line_c 2 "  - remove all nginx files created by this script"
+    line_c 3 "  - restore original inbound ports"
+    line_c 4 "  - remove host rows created by this script"
+    line_c 5 "  - remove sysctl, limits and cron entries"
+    line_c 6 "  - remove state, logs and backups"
+    echo
     local c; c=$(ask "Proceed with full uninstall? [y/N]" v_yn "no")
-    [ "$c" = "yes" ] || { pause; return 0; }
+    [ "$c" = "yes" ] || { warn "Cancelled."; pause; return 0; }
     local wipe; wipe=$(ask "Also delete website files in ${SITE_ROOT}? [y/N]" v_yn "no")
 
     load_state
@@ -2391,11 +2649,13 @@ do_uninstall() {
     rmdir /etc/systemd/system/"${XUI_SERVICE}".service.d 2>/dev/null || true
     rm -f /etc/systemd/system.conf.d/reality443-limits.conf
     systemctl daemon-reload >/dev/null 2>&1 || true
+    ok "Systemd units removed"
 
     if crontab -l >/dev/null 2>&1; then
         crontab -l 2>/dev/null | grep -v 'reality443\|reality-443' | crontab - 2>/dev/null || true
     fi
     rm -f /etc/cron.d/reality443 2>/dev/null || true
+    ok "Cron entries removed"
 
     if [ -f "$PORTS_FILE" ] && db_ready; then
         local n i id lst prt
@@ -2407,6 +2667,9 @@ do_uninstall() {
             prt=$(jq -r ".[$i].port" "$PORTS_FILE")
             xsql "UPDATE inbounds SET listen='$(esc "$lst")', port=${prt} WHERE id=${id};" || true
         done
+        ok "Inbound ports restored"
+    else
+        warn "No original port record - inbound ports left unchanged."
     fi
 
     if db_ready && [ -n "$DOMAIN" ]; then
@@ -2415,6 +2678,7 @@ do_uninstall() {
         [ -n "$hn" ] || hn=0
         if [ "$hn" -gt 0 ]; then
             xsql "DELETE FROM hosts WHERE address='$(esc "$DOMAIN")';" || true
+            ok "Removed ${hn} host row(s)"
         fi
     fi
     systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
@@ -2434,16 +2698,22 @@ do_uninstall() {
             fi
         done
         rmdir "$DISABLED_DIR" 2>/dev/null || true
+        ok "Original nginx sites restored"
     fi
+    ok "nginx files removed"
 
     rm -f "$SYSCTL_FILE" "$LIMITS_FILE" /etc/modules-load.d/reality443.conf
     sysctl --system >/dev/null 2>&1 || true
+    ok "Kernel tuning reverted"
 
-    [ "$wipe" = "yes" ] && [ -d "$SITE_ROOT" ] && rm -rf "${SITE_ROOT:?}"
+    [ "$wipe" = "yes" ] && [ -d "$SITE_ROOT" ] && { rm -rf "${SITE_ROOT:?}"; ok "Website files deleted"; }
 
     if have nginx; then
         if nginx -t >/dev/null 2>&1; then
             systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null || true
+            ok "nginx reloaded"
+        else
+            err "nginx config invalid after removal - check manually"
         fi
     fi
 
@@ -2457,17 +2727,22 @@ do_uninstall() {
 
     echo
     printf '%s ✓ Uninstall completed successfully %s\n' "$BG_OK" "$R"
+    printf '%s ✓ System restored to pre-install state %s\n' "$BG_OK" "$R"
+    echo
+    printf '%s  Backups kept at %s%s\n' "$C_SLATE" "$BACKUP_ROOT" "$R"
+    printf '%s  Script binary kept at %s%s\n' "$C_SLATE" "$INSTALL_PATH" "$R"
     echo
     pause
 }
 
+
 restart_services() {
     header
     step "Restarting services"
-    systemctl restart "$XUI_SERVICE" >/dev/null 2>&1
-    systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1
+    systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 && ok "x-ui restarted" || err "x-ui restart failed"
+    systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1 && ok "nginx restarted" || err "nginx restart failed"
     if systemctl list-unit-files "${GUARD_NAME}.service" >/dev/null 2>&1; then
-        systemctl restart "${GUARD_NAME}.service" >/dev/null 2>&1
+        systemctl restart "${GUARD_NAME}.service" >/dev/null 2>&1 && ok "watchdog restarted" || warn "watchdog not installed"
     fi
     echo
     printf '%s  x-ui      %s%s\n' "$C_TURQ" "$(systemctl is-active "$XUI_SERVICE" 2>/dev/null || echo inactive)" "$R"
@@ -2479,60 +2754,14 @@ restart_services() {
 do_rollback() {
     header
     if [ ! -e "${BACKUP_ROOT}/latest" ]; then
+        err "No backup found."
         pause; return 0
     fi
     local dir c
     dir=$(readlink -f "${BACKUP_ROOT}/latest")
+    step "Rollback"
+    info "Restoring from ${dir}"
     c=$(ask "Restore database and nginx config? [y/N]" v_yn "no")
-    [ "$c" = "yes" ] || { pause; return 0; }
-    
+    [ "$c" = "yes" ] || { warn "Cancelled."; pause; return 0; }
     systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-    
-    if [ -f "${dir}/x-ui.db" ]; then
-        cp -a "${dir}/x-ui.db" "$DB_PATH"
-    fi
-    
-    restore_nginx_from "$dir"
-    
-    if have nginx; then
-        if nginx -t >/dev/null 2>&1; then
-            systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null || true
-        fi
-    fi
-    
-    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-    
-    ok "Rollback completed."
-    pause
-}
-
-main_menu() {
-    while true; do
-        header
-        printf "%s  1)%s Setup / Install\n" "$C_TURQ" "$R"
-        printf "%s  2)%s Sync / Update Routing\n" "$C_TURQ" "$R"
-        printf "%s  3)%s Diagnose\n" "$C_TURQ" "$R"
-        printf "%s  4)%s Restart Services\n" "$C_TURQ" "$R"
-        printf "%s  5)%s Rollback\n" "$C_TURQ" "$R"
-        printf "%s  6)%s Uninstall\n" "$C_TURQ" "$R"
-        printf "%s  0)%s Exit\n" "$C_PINK" "$R"
-        echo
-        local pick
-        read -r -p "  Select an option: " pick
-        case "$pick" in
-            1) do_setup ;;
-            2) do_sync ;;
-            3) diagnose ;;
-            4) restart_services ;;
-            5) do_rollback ;;
-            6) do_uninstall ;;
-            0) exit 0 ;;
-            *) sleep 1 ;;
-        esac
-    done
-}
-
-require_root
-acquire_lock
-ensure_deps
-main_menu
+    [ -f "
