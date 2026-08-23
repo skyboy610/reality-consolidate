@@ -123,16 +123,15 @@ require_root() {
 header() {
     clear
     local -a art=(
-' ██████╗ ███████╗ █████╗ ██╗     ██╗████████╗██╗   ██╗   ██╗  ██╗██╗  ██╗██████╗ '
-' ██╔══██╗██╔════╝██╔══██╗██║     ██║╚══██╔══╝╚██╗ ██╔╝   ██║  ██║██║  ██║╚════██╗'
-' ██████╔╝█████╗  ███████║██║     ██║   ██║    ╚████╔╝    ███████║███████║ █████╔╝'
-' ██╔══██╗██╔══╝  ██╔══██║██║     ██║   ██║     ╚██╔╝     ╚════██║╚════██║ ╚═══██╗'
-' ██║  ██║███████╗██║  ██║███████╗██║   ██║      ██║           ██║     ██║██████╔╝'
-' ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝╚═╝   ╚═╝      ╚═╝           ╚═╝     ╚═╝╚═════╝ '
+'  ████ ████  ██  █    ███ █████ █   █ █  █ █  █ ████'
+'  █  █ █    █  █ █     █    █    █ █  █  █ █  █    █'
+'  ████ ███  ████ █     █    █     █   ████ ████  ███'
+'  █ █  █    █  █ █     █    █     █      █    █    █'
+'  █  █ ████ █  █ ████ ███   █     █      █    █ ████'
     )
     local i=0 l
     for l in "${art[@]}"; do line_c "$i" "$l"; i=$((i + 1)); done
-    printf '%s   SNI Router for 3x-ui Reality  ·  Production Build  ·  v%s%s\n\n' "$C_TURQ" "$SCRIPT_VERSION" "$R"
+    printf '%s   SNI Router for 3x-ui Reality  ·  v%s%s\n\n' "$C_TURQ" "$SCRIPT_VERSION" "$R"
     banner
 }
 
@@ -1429,7 +1428,6 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 5
 ExecStart=${INSTALL_PATH} --daemon
 Restart=always
 RestartSec=10
@@ -1451,11 +1449,63 @@ UNIT
     systemctl restart "${GUARD_NAME}.service" >/dev/null 2>&1 || true
     systemctl enable "$NGINX_SERVICE" >/dev/null 2>&1 || true
     systemctl enable "$XUI_SERVICE" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "${GUARD_NAME}.service"; then
-        return 0
-    fi
-    warn "Watchdog service did not report active."
+    local i
+    for ((i = 0; i < 15; i++)); do
+        systemctl is-active --quiet "${GUARD_NAME}.service" && return 0
+        sleep 1
+    done
+    err "Watchdog service failed to start. Details:"
+    systemctl status "${GUARD_NAME}.service" --no-pager 2>&1 | tail -n 12 >&2
+    journalctl -u "${GUARD_NAME}.service" -n 15 --no-pager 2>&1 | tail -n 15 >&2
     return 1
+}
+
+setup_firewall_auto() {
+    local -a sports=()
+    mapfile -t sports < <(ssh_ports)
+    if [ "${#sports[@]}" -eq 0 ]; then
+        sports=(22)
+        [ -n "${SSH_CONNECTION:-}" ] && sports+=("${SSH_CONNECTION##* }")
+    fi
+    if ! have ufw; then
+        install_pkgs ufw || true
+    fi
+    if ! have ufw; then
+        warn "ufw not available - firewall step skipped"
+        return 1
+    fi
+    local sp failed=0
+    for sp in "${sports[@]}"; do
+        fw_allow "$sp" "SSH" || failed=$((failed + 1))
+    done
+    if [ "$failed" -gt 0 ]; then
+        err "SSH rule failed - firewall left untouched to avoid lockout"
+        return 1
+    fi
+    if ! ufw show added 2>/dev/null | grep -qE "allow[[:space:]]+${sports[0]}"; then
+        err "SSH rule did not register - firewall left untouched"
+        return 1
+    fi
+    fw_allow 80 "http" || true
+    fw_allow 443 "https" || true
+    fw_allow 443 "quic" udp || true
+    fw_allow "$(panel_port)" "panel" || true
+    fw_allow "$(sub_port)" "subscription" || true
+    if ! ufw --force enable >/dev/null 2>&1; then
+        err "Could not enable ufw"
+        return 1
+    fi
+    local okssh=0
+    for sp in "${sports[@]}"; do
+        ufw status 2>/dev/null | grep -qE "^${sp}(/tcp)?[[:space:]]" && okssh=1
+    done
+    if [ "$okssh" -eq 0 ]; then
+        ufw disable >/dev/null 2>&1 || true
+        err "SSH port not open after enabling - firewall disabled again for safety"
+        return 1
+    fi
+    ok "Firewall active (SSH ${sports[*]}, 80, 443 tcp+udp, panel, subscription)"
+    return 0
 }
 
 guard_loop() {
@@ -1525,7 +1575,7 @@ verify_live() {
 }
 
 success_report() {
-    local ppath
+    local ppath issues="${1:-0}"
     echo
     printf '%s ✓ Installation completed successfully %s\n' "$BG_OK" "$R"
     printf '%s ✓ Configuration applied successfully %s\n' "$BG_OK" "$R"
@@ -1542,7 +1592,11 @@ success_report() {
     fi
     printf '%s  Routed      %s inbound(s) on port 443%s\n' "$C_MINT" "${#SEL_IDX[@]}" "$R"
     printf '%s  Watchdog    %s%s\n' "$C_LILAC" "$(systemctl is-active "${GUARD_NAME}.service" 2>/dev/null || echo inactive)" "$R"
+    printf '%s  Firewall    %s%s\n' "$C_ROSE" "$(ufw status 2>/dev/null | head -1 | sed 's/Status: //' || echo 'not installed')" "$R"
     echo
+    if [ "$issues" -gt 0 ]; then
+        printf '%s ! %s step(s) need attention - see the messages above %s\n\n' "$BG_WARN" "$issues" "$R"
+    fi
     printf '%s  Point %s and every Reality SNI at this server IP.%s\n' "$C_SLATE" "$DOMAIN" "$R"
     echo
 }
@@ -1568,31 +1622,45 @@ do_setup() {
     step "Domain"
     DOMAIN=$(ask "Domain for this server" v_domain "$DOMAIN")
 
-    install_nginx || { pause; return 0; }
-    sync_nginx_paths
+    clear
+    header
+    step "FULL AUTOMATIC INSTALLATION"
+    line_c 0 "  1/10  nginx and stream module"
+    line_c 1 "  2/10  kernel and socket tuning"
+    line_c 2 "  3/10  file descriptor limits"
+    line_c 3 "  4/10  nginx core tuning"
+    line_c 4 "  5/10  inbound consolidation"
+    line_c 5 "  6/10  TLS certificate"
+    line_c 6 "  7/10  camouflage site + panel"
+    line_c 7 "  8/10  443 SNI routing"
+    line_c 8 "  9/10  firewall"
+    line_c 9 " 10/10  watchdog and auto-start"
+    echo
 
-    SITE_CERT=""; SITE_KEY=""
-    if auto_select_cert "$DOMAIN"; then
-        ok "Certificate found for ${DOMAIN}"
-        SITE_MODE="local"
-        PANEL_ON_SITE="yes"
-        SUB_ON_SITE="yes"
-    else
-        warn "No certificate covering ${DOMAIN} was found - the site will be HTTP only."
-        SITE_MODE="local"
-        PANEL_ON_SITE="no"
-        SUB_ON_SITE="no"
+    local bdir failed_steps=0
+
+    step "[1/10] nginx"
+    if ! install_nginx; then
+        err "nginx could not be installed - cannot continue"
+        pause; return 0
     fi
+    sync_nginx_paths
+    ok "nginx ready with stream support"
+
+    bdir=$(backup_now)
+    save_original_ports
     save_state
 
-    local bdir; bdir=$(backup_now)
-    save_original_ports
-
-    step "Applying"
+    step "[2/10] kernel tuning"
     apply_sysctl
+
+    step "[3/10] limits"
     apply_limits
+
+    step "[4/10] nginx core"
     tune_nginx_main
 
+    step "[5/10] inbound consolidation"
     local idx i cur
     PLAN_PORT=()
     for idx in "${SEL_IDX[@]}"; do
@@ -1601,11 +1669,13 @@ do_setup() {
             TAKEN_PORTS["$cur"]=keep
             PLAN_PORT[$i]="$cur"
         else
-            alloc_port "$cur" || { pause; return 0; }
+            if ! alloc_port "$cur"; then
+                err "Could not allocate an internal port"
+                pause; return 0
+            fi
             PLAN_PORT[$i]="$ALLOC_PORT"
         fi
     done
-
     systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
     local -a wait_ports=()
     for idx in "${SEL_IDX[@]}"; do
@@ -1617,16 +1687,27 @@ do_setup() {
         fi
         set_inbound_host "${RI_ID[$i]}" "$DOMAIN" "${RI_REMARK[$i]:-reality}" 443
         wait_ports+=("${PLAN_PORT[$i]}")
+        ok "${RI_REMARK[$i]:-inbound} -> $(backend_ip "${RI_LISTEN[$i]}"):${PLAN_PORT[$i]}"
     done
     save_routed_ports "${wait_ports[@]}"
-    ok "Database updated for ${#SEL_IDX[@]} inbound(s)"
 
+    step "[6/10] certificate"
+    SITE_CERT=""; SITE_KEY=""
+    if auto_select_cert "$DOMAIN"; then
+        ok "Certificate matched for ${DOMAIN}"
+        SITE_MODE="local"; PANEL_ON_SITE="yes"; SUB_ON_SITE="yes"
+    else
+        warn "No certificate covering ${DOMAIN} - site will be HTTP only"
+        SITE_MODE="local"; PANEL_ON_SITE="no"; SUB_ON_SITE="no"
+        failed_steps=$((failed_steps + 1))
+    fi
     if [ "$PANEL_ON_SITE" = "yes" ]; then
         ensure_panel_path >/dev/null
     fi
-
+    save_state
     start_xui_and_wait "${wait_ports[@]}" || true
 
+    step "[7/10] camouflage site"
     generate_default_site
     if [ -n "$SITE_CERT" ]; then
         pick_site_port || true
@@ -1634,23 +1715,38 @@ do_setup() {
     fi
     save_state
     disable_stock_default_site
-    write_site_conf || warn "Camouflage site config was not written."
+    if write_site_conf; then
+        ok "Site configuration written"
+    else
+        warn "Site configuration failed"
+        failed_steps=$((failed_steps + 1))
+    fi
 
+    step "[8/10] 443 routing"
     load_inbounds
     if ! write_stream_conf || ! hook_stream_include; then
-        err "nginx routing could not be completed. Fix the error above and run Sync."
+        err "nginx routing could not be built"
         pause; return 0
     fi
     if ! apply_nginx "$bdir"; then
-        err "nginx rolled back. The database is already consolidated - fix nginx and run Sync."
+        err "nginx rolled back - database is consolidated, fix nginx then run Sync"
         pause; return 0
     fi
-    ok "nginx reloaded - SNI routing is live on 443"
+    ok "nginx reloaded - SNI routing live on 443"
 
-    install_guard_service || true
+    step "[9/10] firewall"
+    setup_firewall_auto || failed_steps=$((failed_steps + 1))
 
-    verify_live || warn "Some verification checks failed - open Diagnose for details."
-    success_report
+    step "[10/10] watchdog"
+    if install_guard_service; then
+        ok "Watchdog running, auto-start enabled"
+    else
+        warn "Watchdog not active - use: Services and Watchdog > Install / Repair Watchdog"
+        failed_steps=$((failed_steps + 1))
+    fi
+
+    verify_live || failed_steps=$((failed_steps + 1))
+    success_report "$failed_steps"
     pause
 }
 
