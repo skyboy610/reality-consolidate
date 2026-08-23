@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="5.1.0"
+SCRIPT_VERSION="5.3.0"
 SELF_SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${0:-}")"
 
 DB_PATH="${DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -49,6 +49,10 @@ SITE_CERT=""
 SITE_KEY=""
 SITE_BIND_PORT=""
 SITE_SRC_ARG=""
+SUB_DOMAIN=""
+SUB_CERT=""
+SUB_KEY=""
+SUB_BIND_PORT=""
 PANEL_ON_SITE="no"
 SUB_ON_SITE="no"
 
@@ -304,6 +308,77 @@ panel_path() { norm_path "$(get_setting webBasePath)"; }
 sub_path()   { norm_path "$(get_setting subPath)"; }
 panel_scheme() { [ -n "$(get_setting webCertFile)" ] && printf 'https\n' || printf 'http\n'; }
 sub_scheme()   { [ -n "$(get_setting subCertFile)" ] && printf 'https\n' || printf 'http\n'; }
+sub_json_path() { norm_path "$(get_setting subJsonPath)"; }
+
+sub_enabled() {
+    local v
+    v=$(printf '%s' "$(get_setting subEnable)" | tr '[:upper:]' '[:lower:]')
+    case "$v" in true|1|yes|on) return 0 ;; esac
+    return 1
+}
+
+sub_is_separate() {
+    [ -n "$SUB_DOMAIN" ] || return 1
+    [ "$SUB_DOMAIN" != "$DOMAIN" ] || return 1
+    [ -n "$SUB_CERT" ] || return 1
+    [ -n "$SUB_BIND_PORT" ] || return 1
+    return 0
+}
+
+pick_sub_port() {
+    local p limit
+    p=$((SITE_PORT + 1))
+    limit=$((p + 300))
+    refresh_taken_ports 2>/dev/null || true
+    while [ "$p" -le "$limit" ]; do
+        [ "$p" = "$SITE_PORT" ] && { p=$((p + 1)); continue; }
+        if [ "$p" = "${SUB_BIND_PORT:-}" ] && ! port_busy "$p"; then SUB_BIND_PORT="$p"; return 0; fi
+        if [ -z "${TAKEN_PORTS[$p]:-}" ] && ! port_busy "$p"; then SUB_BIND_PORT="$p"; return 0; fi
+        p=$((p + 1))
+    done
+    err "No free loopback port for the subscription vhost"
+    return 1
+}
+
+configure_subscription() {
+    local spath jpath
+    spath=$(sub_path)
+    if ! sub_enabled; then
+        SUB_ON_SITE="no"
+        warn "Subscription is disabled in the panel - not published on the domain"
+        warn "Enable it in the panel, then run option 2 to republish"
+        return 0
+    fi
+    if [ -z "$spath" ]; then
+        spath="/sub"
+        set_setting subPath "${spath}/"
+        warn "Subscription had no path - set to ${spath}/"
+    fi
+    if [ "$spath" = "$(panel_path)" ]; then
+        SUB_ON_SITE="no"
+        err "Subscription path equals the panel path - cannot publish both"
+        return 0
+    fi
+    [ -n "$SUB_DOMAIN" ] || SUB_DOMAIN="$DOMAIN"
+    if [ "$SUB_DOMAIN" != "$DOMAIN" ]; then
+        SUB_CERT=""; SUB_KEY=""
+        if auto_select_cert_into "$SUB_DOMAIN" SUB_CERT SUB_KEY; then
+            ok "Certificate matched for ${SUB_DOMAIN}"
+            pick_sub_port || { SUB_DOMAIN="$DOMAIN"; SUB_CERT=""; SUB_KEY=""; }
+        else
+            err "No certificate covering ${SUB_DOMAIN} - falling back to ${DOMAIN}"
+            SUB_DOMAIN="$DOMAIN"; SUB_CERT=""; SUB_KEY=""; SUB_BIND_PORT=""
+        fi
+    fi
+    SUB_ON_SITE="yes"
+    set_setting subURI "https://${SUB_DOMAIN}${spath}/"
+    jpath=$(sub_json_path)
+    if [ -n "$jpath" ] && [ "$jpath" != "$spath" ]; then
+        set_setting subJsonURI "https://${SUB_DOMAIN}${jpath}/"
+    fi
+    ok "Subscription URL: https://${SUB_DOMAIN}${spath}/"
+    return 0
+}
 
 ensure_panel_path() {
     local p; p=$(panel_path)
@@ -373,6 +448,11 @@ load_state() {
     SITE_BIND_PORT=$(jq -r '.site_bind_port // ""' "$STATE_FILE" 2>/dev/null || echo "")
     PANEL_ON_SITE=$(jq -r '.panel_on_site // "no"' "$STATE_FILE" 2>/dev/null || echo no)
     SUB_ON_SITE=$(jq -r '.sub_on_site // "no"' "$STATE_FILE" 2>/dev/null || echo no)
+    SUB_DOMAIN=$(jq -r '.sub_domain // ""' "$STATE_FILE" 2>/dev/null || echo "")
+    SUB_CERT=$(jq -r '.sub_cert // ""' "$STATE_FILE" 2>/dev/null || echo "")
+    SUB_KEY=$(jq -r '.sub_key // ""' "$STATE_FILE" 2>/dev/null || echo "")
+    SUB_BIND_PORT=$(jq -r '.sub_bind_port // ""' "$STATE_FILE" 2>/dev/null || echo "")
+    [ -n "$SUB_DOMAIN" ] || SUB_DOMAIN="$DOMAIN"
     [ -n "$SITE_BIND_PORT" ] && SITE_PORT="$SITE_BIND_PORT"
     return 0
 }
@@ -382,8 +462,10 @@ save_state() {
     jq -n --arg d "$DOMAIN" --arg sm "$SITE_MODE" --arg st "$SITE_TARGET" \
           --arg sc "$SITE_CERT" --arg sk "$SITE_KEY" --arg sbp "$SITE_PORT" \
           --arg pos "$PANEL_ON_SITE" --arg sos "$SUB_ON_SITE" \
+          --arg sd2 "$SUB_DOMAIN" --arg sc2 "$SUB_CERT" --arg sk2 "$SUB_KEY" --arg sbp2 "$SUB_BIND_PORT" \
         '{domain:$d, site_mode:$sm, site_target:$st, site_cert:$sc, site_key:$sk,
-          site_bind_port:$sbp, panel_on_site:$pos, sub_on_site:$sos}' > "$STATE_FILE"
+          site_bind_port:$sbp, panel_on_site:$pos, sub_on_site:$sos,
+          sub_domain:$sd2, sub_cert:$sc2, sub_key:$sk2, sub_bind_port:$sbp2}' > "$STATE_FILE"
     chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
@@ -889,6 +971,9 @@ write_stream_conf() {
     }
 
     [ -n "$site_be" ] && add_map_entry "$DOMAIN" "$site_be" "site"
+    if [ -f "$SITE_CONF" ] && [ "$SUB_ON_SITE" = "yes" ] && sub_is_separate; then
+        add_map_entry "$SUB_DOMAIN" "127.0.0.1:${SUB_BIND_PORT}" "subscription"
+    fi
     for ((i = 0; i < ${#RI_ID[@]}; i++)); do
         if is_routable_listen "${RI_LISTEN[$i]}" && [ -n "${RI_SNI[$i]}" ]; then
             bip=$(backend_ip "${RI_LISTEN[$i]}")
@@ -1132,20 +1217,32 @@ cert_covers_domain() {
     return 1
 }
 
-auto_select_cert() {
-    local dom="$1" p pd pc pk
+auto_select_cert_into() {
+    local dom="$1" cvar="$2" kvar="$3" p pd pc pk
     local -a pairs=()
     mapfile -t pairs < <(find_cert_pairs)
     [ "${#pairs[@]}" -eq 0 ] && return 1
     for p in "${pairs[@]}"; do
         IFS='|' read -r pd pc pk <<< "$p"
-        [ "$pd" = "$dom" ] && { SITE_CERT="$pc"; SITE_KEY="$pk"; return 0; }
+        if [ "$pd" = "$dom" ]; then
+            printf -v "$cvar" '%s' "$pc"
+            printf -v "$kvar" '%s' "$pk"
+            return 0
+        fi
     done
     for p in "${pairs[@]}"; do
         IFS='|' read -r pd pc pk <<< "$p"
-        if cert_covers_domain "$pc" "$dom"; then SITE_CERT="$pc"; SITE_KEY="$pk"; return 0; fi
+        if cert_covers_domain "$pc" "$dom"; then
+            printf -v "$cvar" '%s' "$pc"
+            printf -v "$kvar" '%s' "$pk"
+            return 0
+        fi
     done
     return 1
+}
+
+auto_select_cert() {
+    auto_select_cert_into "$1" SITE_CERT SITE_KEY
 }
 
 
@@ -1279,9 +1376,70 @@ disable_stock_default_site() {
     done
 }
 
+emit_sub_locations() {
+    local spath sport2 sscheme jpath lpath ppath
+    spath=$(sub_path); sport2=$(sub_port); sscheme=$(sub_scheme)
+    jpath=$(sub_json_path); ppath=$(panel_path)
+    for lpath in "$spath" "$jpath"; do
+        [ -n "$lpath" ] || continue
+        [ "$lpath" = "$ppath" ] && continue
+        [ "$lpath" = "$jpath" ] && [ "$jpath" = "$spath" ] && continue
+        echo "    location ${lpath}/ {"
+        echo "        proxy_pass ${sscheme}://127.0.0.1:${sport2};"
+        if [ "$sscheme" = "https" ]; then
+            echo "        proxy_ssl_verify off;"
+            echo "        proxy_ssl_server_name on;"
+        fi
+        echo "        proxy_http_version 1.1;"
+        echo "        proxy_buffering off;"
+        echo "        proxy_set_header Host \$host;"
+        echo "        proxy_set_header X-Real-IP \$remote_addr;"
+        echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+        echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+        echo "        proxy_connect_timeout 5s;"
+        echo "        proxy_read_timeout 120s;"
+        echo "    }"
+        echo "    location = ${lpath} { return 301 ${lpath}/; }"
+    done
+}
+
+emit_tls_common() {
+    local crt="$1" key="$2"
+    echo "    ssl_certificate ${crt};"
+    echo "    ssl_certificate_key ${key};"
+    echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+    echo "    ssl_prefer_server_ciphers off;"
+    echo "    ssl_session_cache shared:R443SSL:50m;"
+    echo "    ssl_session_timeout 1d;"
+    echo "    ssl_session_tickets off;"
+    echo "    port_in_redirect off;"
+    echo "    absolute_redirect off;"
+    echo "    client_max_body_size 64m;"
+}
+
+emit_listen_ssl() {
+    local port="$1"
+    if nginx_ver_ge 1.25.1; then
+        echo "    listen 127.0.0.1:${port} ssl backlog=65535;"
+        echo "    http2 on;"
+    else
+        echo "    listen 127.0.0.1:${port} ssl http2 backlog=65535;"
+    fi
+}
+
+emit_site_root() {
+    if [ "$SITE_MODE" = "redirect" ] && [ -n "$SITE_TARGET" ]; then
+        echo "    location / { return 301 https://${SITE_TARGET}\$request_uri; }"
+    else
+        echo "    root ${SITE_ROOT};"
+        echo "    index index.html index.htm;"
+        echo "    location / { try_files \$uri \$uri/ /index.html; }"
+    fi
+}
+
 write_site_conf() {
     ensure_confd_included
-    local tmp ppath pport pscheme spath sport2 sscheme
+    local tmp ppath pport pscheme
     tmp=$(mktemp)
     {
         echo "# reality443-managed v${SCRIPT_VERSION}"
@@ -1302,23 +1460,9 @@ write_site_conf() {
         if [ -n "$DOMAIN" ] && [ -n "$SITE_CERT" ] && [ -n "$SITE_KEY" ]; then
             echo ""
             echo "server {"
-            if nginx_ver_ge 1.25.1; then
-                echo "    listen 127.0.0.1:${SITE_PORT} ssl backlog=65535;"
-                echo "    http2 on;"
-            else
-                echo "    listen 127.0.0.1:${SITE_PORT} ssl http2 backlog=65535;"
-            fi
+            emit_listen_ssl "$SITE_PORT"
             echo "    server_name ${DOMAIN};"
-            echo "    ssl_certificate ${SITE_CERT};"
-            echo "    ssl_certificate_key ${SITE_KEY};"
-            echo "    ssl_protocols TLSv1.2 TLSv1.3;"
-            echo "    ssl_prefer_server_ciphers off;"
-            echo "    ssl_session_cache shared:R443SSL:50m;"
-            echo "    ssl_session_timeout 1d;"
-            echo "    ssl_session_tickets off;"
-            echo "    port_in_redirect off;"
-            echo "    absolute_redirect off;"
-            echo "    client_max_body_size 64m;"
+            emit_tls_common "$SITE_CERT" "$SITE_KEY"
             if [ "$PANEL_ON_SITE" = "yes" ]; then
                 ppath=$(panel_path); pport=$(panel_port); pscheme=$(panel_scheme)
                 if [ -n "$ppath" ]; then
@@ -1346,34 +1490,20 @@ write_site_conf() {
                     echo "    location = ${ppath} { return 301 ${ppath}/; }"
                 fi
             fi
-            if [ "$SUB_ON_SITE" = "yes" ]; then
-                spath=$(sub_path); sport2=$(sub_port); sscheme=$(sub_scheme)
-                ppath=$(panel_path)
-                if [ -n "$spath" ] && [ "$spath" != "$ppath" ]; then
-                    echo "    location ${spath}/ {"
-                    echo "        proxy_pass ${sscheme}://127.0.0.1:${sport2};"
-                    if [ "$sscheme" = "https" ]; then
-                        echo "        proxy_ssl_verify off;"
-                        echo "        proxy_ssl_server_name on;"
-                    fi
-                    echo "        proxy_http_version 1.1;"
-                    echo "        proxy_buffering off;"
-                    echo "        proxy_set_header Host \$host;"
-                    echo "        proxy_set_header X-Real-IP \$remote_addr;"
-                    echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
-                    echo "        proxy_connect_timeout 5s;"
-                    echo "        proxy_read_timeout 120s;"
-                    echo "    }"
-                    echo "    location = ${spath} { return 301 ${spath}/; }"
-                fi
+            if [ "$SUB_ON_SITE" = "yes" ] && ! sub_is_separate; then
+                emit_sub_locations
             fi
-            if [ "$SITE_MODE" = "redirect" ] && [ -n "$SITE_TARGET" ]; then
-                echo "    location / { return 301 https://${SITE_TARGET}\$request_uri; }"
-            else
-                echo "    root ${SITE_ROOT};"
-                echo "    index index.html index.htm;"
-                echo "    location / { try_files \$uri \$uri/ /index.html; }"
-            fi
+            emit_site_root
+            echo "}"
+        fi
+        if [ "$SUB_ON_SITE" = "yes" ] && sub_is_separate; then
+            echo ""
+            echo "server {"
+            emit_listen_ssl "$SUB_BIND_PORT"
+            echo "    server_name ${SUB_DOMAIN};"
+            emit_tls_common "$SUB_CERT" "$SUB_KEY"
+            emit_sub_locations
+            emit_site_root
             echo "}"
         fi
     } > "$tmp"
@@ -1618,6 +1748,9 @@ success_report() {
         ppath=$(panel_path)
         printf '%s  Panel URL   https://%s%s/%s\n' "$C_GOLD" "$DOMAIN" "$ppath" "$R"
     fi
+    if [ "$SUB_ON_SITE" = "yes" ]; then
+        printf '%s  Sub URL     https://%s%s/%s\n' "$C_SAND" "$SUB_DOMAIN" "$(sub_path)" "$R"
+    fi
     printf '%s  Routed      %s inbound(s) on port 443%s\n' "$C_MINT" "${#SEL_IDX[@]}" "$R"
     printf '%s  Watchdog    %s%s\n' "$C_LILAC" "$(systemctl is-active "${GUARD_NAME}.service" 2>/dev/null || echo inactive)" "$R"
     printf '%s  Firewall    %s%s\n' "$C_ROSE" "$(ufw status 2>/dev/null | head -1 | sed 's/Status: //' || echo 'not installed')" "$R"
@@ -1625,7 +1758,11 @@ success_report() {
     if [ "$issues" -gt 0 ]; then
         printf '%s ! %s step(s) need attention - see the messages above %s\n\n' "$BG_WARN" "$issues" "$R"
     fi
-    printf '%s  Point %s and every Reality SNI at this server IP.%s\n' "$C_SLATE" "$DOMAIN" "$R"
+    if [ "$SUB_DOMAIN" != "$DOMAIN" ]; then
+        printf '%s  Point %s, %s and every Reality SNI at this server IP.%s\n' "$C_SLATE" "$DOMAIN" "$SUB_DOMAIN" "$R"
+    else
+        printf '%s  Point %s and every Reality SNI at this server IP.%s\n' "$C_SLATE" "$DOMAIN" "$R"
+    fi
     echo
 }
 
@@ -1647,8 +1784,10 @@ do_setup() {
     parse_selection
     validate_selection || { pause; return 0; }
 
-    step "Domain"
-    DOMAIN=$(ask "Domain for this server" v_domain "$DOMAIN")
+    step "Domains"
+    DOMAIN=$(ask "Main domain (site, panel, links)" v_domain "$DOMAIN")
+    [ -n "$SUB_DOMAIN" ] || SUB_DOMAIN="$DOMAIN"
+    SUB_DOMAIN=$(ask "Subscription domain (Enter = same)" v_domain "$SUB_DOMAIN")
 
     clear
     header
@@ -1731,6 +1870,7 @@ do_setup() {
     fi
     if [ "$PANEL_ON_SITE" = "yes" ]; then
         ensure_panel_path >/dev/null
+        configure_subscription
     fi
     save_state
     start_xui_and_wait "${wait_ports[@]}" || true
@@ -1895,8 +2035,11 @@ diagnose() {
 
     step "Configuration"
     printf '%s  Domain            %s%s\n' "$C_TURQ" "${DOMAIN:-<unset>}" "$R"
+    printf '%s  Sub domain        %s%s\n' "$C_LILAC" "${SUB_DOMAIN:-<same>}" "$R"
     printf '%s  Panel             %s://127.0.0.1:%s%s%s\n' "$C_GOLD" "$(panel_scheme)" "$(panel_port)" "$(panel_path)" "$R"
     printf '%s  Subscription      %s://127.0.0.1:%s%s%s\n' "$C_MINT" "$(sub_scheme)" "$(sub_port)" "$(sub_path)" "$R"
+    printf '%s  Sub enabled       %s%s\n' "$C_SAND" "$(sub_enabled && echo yes || echo NO)" "$R"
+    printf '%s  Sub URI setting   %s%s\n' "$C_ROSE" "$(get_setting subURI)" "$R"
     printf '%s  Stream file       %s%s\n' "$C_LILAC" "$([ -f "$STREAM_FILE" ] && echo present || echo MISSING)" "$R"
     printf '%s  Hooked in conf    %s%s\n' "$C_ROSE" "$(grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null && echo yes || echo NO)" "$R"
     printf '%s  SNI routes        %s%s\n' "$C_STEEL" "$(count_routed)" "$R"
@@ -2038,6 +2181,7 @@ do_uninstall() {
     rm -f /usr/local/bin/reality443
     DOMAIN=""; SITE_MODE="none"; SITE_CERT=""; SITE_KEY=""
     PANEL_ON_SITE="no"; SUB_ON_SITE="no"
+    SUB_DOMAIN=""; SUB_CERT=""; SUB_KEY=""; SUB_BIND_PORT=""
 
     echo
     printf '%s ✓ Uninstall completed successfully %s\n' "$BG_OK" "$R"
