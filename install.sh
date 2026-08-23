@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="5.6.0"
+SCRIPT_VERSION="5.9.0"
 SELF_SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${0:-}")"
 
 DB_PATH="${DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -280,6 +280,161 @@ preflight_443() {
     return 0
 }
 
+server_ips() {
+    {
+        ip -4 route get 8.8.8.8 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}'
+        ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+    } | grep -E '^[0-9.]+$' | sort -u
+}
+
+resolve_a() {
+    local host="$1"
+    if have dig; then
+        dig +short +time=3 +tries=2 A "$host" 2>/dev/null | grep -E '^[0-9.]+$'
+    else
+        getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
+    fi
+}
+
+check_dns() {
+    local -a mine=()
+    mapfile -t mine < <(server_ips)
+    if [ "${#mine[@]}" -eq 0 ]; then
+        warn "Could not determine this server's public IP - skipping DNS check"
+        return 0
+    fi
+    local d ips ip m match bad=0
+    local -a doms=("$DOMAIN")
+    [ -n "$SUB_DOMAIN" ] && [ "$SUB_DOMAIN" != "$DOMAIN" ] && doms+=("$SUB_DOMAIN")
+    for d in "${doms[@]}"; do
+        [ -n "$d" ] || continue
+        ips=$(resolve_a "$d")
+        if [ -z "$ips" ]; then
+            err "${d} has no A record - it does not resolve at all"
+            info "create an A record:  ${d}  ->  ${mine[0]}"
+            bad=$((bad + 1))
+            continue
+        fi
+        match=0
+        for ip in $ips; do
+            for m in "${mine[@]}"; do
+                [ "$ip" = "$m" ] && match=1
+            done
+        done
+        if [ "$match" -eq 1 ]; then
+            ok "${d} resolves to this server"
+        else
+            err "${d} resolves to $(printf '%s' "$ips" | tr '\n' ' ' | sed 's/ *$//') - NOT this server (${mine[0]})"
+            info "fix the A record:  ${d}  ->  ${mine[0]}"
+            bad=$((bad + 1))
+        fi
+    done
+    [ "$bad" -eq 0 ] && return 0
+    return 1
+}
+
+check_reality_chain() {
+    local i sni out subj bad=0 shown=0
+    for ((i = 0; i < ${#RI_ID[@]}; i++)); do
+        is_routable_listen "${RI_LISTEN[$i]}" || continue
+        sni="${RI_SNI[$i]}"
+        [ -n "$sni" ] || continue
+        grep -qF "\"${sni}\"" "$STREAM_FILE" 2>/dev/null || continue
+        shown=1
+        out=$(timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$sni" </dev/null 2>&1 || true)
+        subj=$(printf '%s' "$out" | grep -m1 -oE 'subject=.*' | head -c 90)
+        if [ -n "$subj" ]; then
+            ok "${sni} -> Reality chain OK (${subj})"
+        else
+            err "${sni} -> no certificate returned through 443"
+            info "xray is listening but the Reality handshake to its dest is failing"
+            bad=$((bad + 1))
+        fi
+    done
+    [ "$shown" -eq 0 ] && return 0
+    [ "$bad" -eq 0 ] && return 0
+    return 1
+}
+
+reality_dest_of() {
+    local id="$1" d
+    d=$(q "SELECT stream_settings FROM inbounds WHERE id=${id};" \
+        | jq -r '.[0].stream_settings | fromjson | (.realitySettings.dest // .realitySettings.target // "")' 2>/dev/null)
+    printf '%s' "$d"
+}
+
+check_reality_dests() {
+    local i id dest host port out proto alpn bad=0
+    step "Reality target (dest) validation"
+    for ((i = 0; i < ${#RI_ID[@]}; i++)); do
+        is_routable_listen "${RI_LISTEN[$i]}" || continue
+        id="${RI_ID[$i]}"
+        dest=$(reality_dest_of "$id")
+        [ -n "$dest" ] || continue
+        host="${dest%%:*}"
+        port="${dest##*:}"
+        [ "$port" = "$host" ] && port=443
+        out=$(timeout 12 openssl s_client -connect "${host}:${port}" -servername "$host" -tls1_3 -alpn h2 </dev/null 2>&1 || true)
+        proto=$(printf '%s' "$out" | grep -m1 -oE 'New, TLSv[0-9.]+|Protocol version: TLSv[0-9.]+' | grep -oE 'TLSv[0-9.]+')
+        alpn=$(printf '%s' "$out" | grep -m1 -oE 'ALPN protocol: [a-z0-9/.]+' | sed 's/.*: //')
+        if [ -z "$proto" ]; then
+            out=$(timeout 12 openssl s_client -connect "${host}:${port}" -servername "$host" -alpn h2 </dev/null 2>&1 || true)
+            proto=$(printf '%s' "$out" | grep -m1 -oE 'New, TLSv[0-9.]+|Protocol version: TLSv[0-9.]+' | grep -oE 'TLSv[0-9.]+')
+            alpn=$(printf '%s' "$out" | grep -m1 -oE 'ALPN protocol: [a-z0-9/.]+' | sed 's/.*: //')
+        fi
+        if [ "$proto" = "TLSv1.3" ] && [ "$alpn" = "h2" ]; then
+            ok "${RI_REMARK[$i]:-inbound}: dest ${dest} supports TLS1.3 + h2"
+        elif [ "$proto" = "TLSv1.3" ]; then
+            warn "${RI_REMARK[$i]:-inbound}: dest ${dest} has TLS1.3 but ALPN='${alpn:-none}' (h2 expected)"
+            bad=$((bad + 1))
+        elif [ -n "$proto" ]; then
+            err "${RI_REMARK[$i]:-inbound}: dest ${dest} only speaks ${proto} - Reality REQUIRES TLS 1.3"
+            info "clients will fail to connect through this inbound"
+            bad=$((bad + 1))
+        else
+            err "${RI_REMARK[$i]:-inbound}: dest ${dest} is unreachable from this server"
+            bad=$((bad + 1))
+        fi
+        case "$host" in
+            *.ir|*.ir:*) warn "${host} is an Iranian domain - a poor Reality target, prefer a foreign CDN host" ;;
+        esac
+    done
+    [ "$bad" -eq 0 ] && return 0
+    return 1
+}
+
+check_orphan_inbounds() {
+    local json n i id rem lst prt sec snis sn found orphans=0
+    json=$(q "SELECT id, remark, listen, port, stream_settings FROM inbounds WHERE enable=1 OR enable IS NULL;")
+    n=$(printf '%s' "$json" | jq 'length')
+    for ((i = 0; i < n; i++)); do
+        id=$(printf '%s' "$json" | jq -r ".[$i].id")
+        rem=$(printf '%s' "$json" | jq -r ".[$i].remark // \"\"")
+        lst=$(printf '%s' "$json" | jq -r ".[$i].listen // \"\"")
+        prt=$(printf '%s' "$json" | jq -r ".[$i].port")
+        is_routable_listen "$lst" || continue
+        sec=$(printf '%s' "$json" | jq -r ".[$i].stream_settings | fromjson? | .security // \"\"")
+        if [ "$sec" != "reality" ]; then
+            err "'${rem}' listens on ${lst}:${prt} but is not Reality - it is unreachable from outside"
+            info "give it a public listen address in the panel, or delete it"
+            orphans=$((orphans + 1))
+            continue
+        fi
+        snis=$(printf '%s' "$json" | jq -r ".[$i].stream_settings | fromjson | (.realitySettings.serverNames // []) | join(\" \")")
+        found=0
+        for sn in $snis; do
+            grep -qF "\"${sn}\"" "$STREAM_FILE" 2>/dev/null && { found=1; break; }
+        done
+        if [ "$found" -eq 0 ]; then
+            err "'${rem}' listens on ${lst}:${prt} but NO SNI of it is routed on 443 - it is dead"
+            info "run option 2 (Add New Inbounds) to route it, or give it a serverName in the panel"
+            orphans=$((orphans + 1))
+        fi
+    done
+    [ "$orphans" -eq 0 ] && return 0
+    return 1
+}
+
 http_probe() {
     local host="$1" path="${2:-/}" c
     c=$(timeout 15 curl -sk -o /dev/null -w '%{http_code}' --resolve "${host}:443:127.0.0.1" "https://${host}${path}" 2>/dev/null)
@@ -370,7 +525,16 @@ post_install_test() {
             err "firewall is active but 443/tcp is NOT allowed"
             fails=$((fails + 1))
         fi
+    else
+        warn "ufw is not active - the server relies on the provider firewall only"
     fi
+
+    check_orphan_inbounds || fails=$((fails + 1))
+    step "DNS"
+    check_dns || fails=$((fails + 1))
+    step "Reality end-to-end probe through 443"
+    check_reality_chain || fails=$((fails + 1))
+    check_reality_dests || fails=$((fails + 1))
 
     echo
     TEST_FAILS="$fails"
@@ -418,6 +582,7 @@ ensure_deps() {
     have ss || missing+=(iproute2)
     have openssl || missing+=(openssl)
     have curl || missing+=(curl)
+    have dig || missing+=(dnsutils)
     have flock || missing+=(util-linux)
     if [ "${#missing[@]}" -gt 0 ]; then
         info "Installing dependencies: ${missing[*]}"
@@ -955,15 +1120,16 @@ strip_owned_directives() {
     return 0
 }
 
+R443_WCONN=""
 normalize_events_block() {
     [ -f "$NGINX_CONF" ] || return 0
     local tmp
     tmp=$(mktemp)
-    R443_EVENTS='events {
-    worker_connections 65535;
+    R443_EVENTS="events {
+    worker_connections ${R443_WCONN:-16384};
     multi_accept on;
     use epoll;
-}'
+}"
     export R443_EVENTS
     awk '
         BEGIN { st = 0; depth = 0; done_e = 0 }
@@ -999,11 +1165,20 @@ normalize_events_block() {
 tune_nginx_main() {
     local tmp
     tmp=$(mktemp)
+    local mem wconn wfile
+    mem=$(ram_mb)
+    if [ "$mem" -lt 2048 ]; then
+        wconn=16384; wfile=200000
+    elif [ "$mem" -lt 8192 ]; then
+        wconn=32768; wfile=500000
+    else
+        wconn=65535; wfile=1000000
+    fi
     if ! grep -qE '^[[:space:]]*worker_rlimit_nofile' "$NGINX_CONF"; then
-        { printf 'worker_rlimit_nofile 1000000;\n'; cat "$NGINX_CONF"; } > "$tmp"
+        { printf 'worker_rlimit_nofile %s;\n' "$wfile"; cat "$NGINX_CONF"; } > "$tmp"
         mv "$tmp" "$NGINX_CONF"
     else
-        sed -i 's/^[[:space:]]*worker_rlimit_nofile.*/worker_rlimit_nofile 1000000;/' "$NGINX_CONF"
+        sed -i "s/^[[:space:]]*worker_rlimit_nofile.*/worker_rlimit_nofile ${wfile};/" "$NGINX_CONF"
     fi
     sed -i 's/^[[:space:]]*worker_processes[[:space:]].*/worker_processes auto;/' "$NGINX_CONF"
     grep -qE '^worker_processes' "$NGINX_CONF" || sed -i "1a worker_processes auto;" "$NGINX_CONF"
@@ -1011,7 +1186,9 @@ tune_nginx_main() {
     if [ "$(nproc 2>/dev/null || echo 1)" -ge 2 ]; then
         sed -i '/^worker_processes auto;/a worker_cpu_affinity auto;' "$NGINX_CONF"
     fi
+    R443_WCONN="$wconn"
     normalize_events_block
+    R443_WCONN=""
     strip_owned_directives
     ensure_confd_included
     cat > "$NGINX_TUNE" <<'TUNE'
@@ -1034,23 +1211,39 @@ TUNE
     ok "nginx core tuned for high connection count"
 }
 
+ram_mb() {
+    local m
+    m=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    [ -n "$m" ] && [ "$m" -gt 0 ] 2>/dev/null || m=1024
+    printf '%s' "$m"
+}
+
 apply_sysctl() {
-    cat > "$SYSCTL_FILE" <<'SYSCTL'
+    local mem sockmax rmem_hi ct fmax nl_backlog
+    mem=$(ram_mb)
+    if [ "$mem" -lt 2048 ]; then
+        sockmax=16777216;  rmem_hi=16777216;  ct=131072;  fmax=200000;  nl_backlog=16384
+    elif [ "$mem" -lt 8192 ]; then
+        sockmax=33554432;  rmem_hi=33554432;  ct=262144;  fmax=500000;  nl_backlog=65536
+    else
+        sockmax=67108864;  rmem_hi=67108864;  ct=1048576; fmax=1000000; nl_backlog=250000
+    fi
+    cat > "$SYSCTL_FILE" <<SYSCTL
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
+net.core.rmem_max = ${sockmax}
+net.core.wmem_max = ${sockmax}
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
 net.core.optmem_max = 65536
-net.ipv4.tcp_rmem = 4096 1048576 67108864
-net.ipv4.tcp_wmem = 4096 1048576 67108864
+net.ipv4.tcp_rmem = 4096 262144 ${rmem_hi}
+net.ipv4.tcp_wmem = 4096 262144 ${rmem_hi}
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 250000
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_max_tw_buckets = 2000000
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = ${nl_backlog}
+net.ipv4.tcp_max_syn_backlog = 32768
+net.ipv4.tcp_max_tw_buckets = 262144
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
@@ -1063,53 +1256,54 @@ net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 4
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_abort_on_overflow = 0
-net.ipv4.ip_forward = 1
-net.netfilter.nf_conntrack_max = 1048576
-fs.file-max = 1000000
-fs.nr_open = 1000000
+net.netfilter.nf_conntrack_max = ${ct}
+fs.file-max = ${fmax}
 vm.swappiness = 10
 SYSCTL
     modprobe tcp_bbr >/dev/null 2>&1 || true
-    grep -q '^tcp_bbr$' /etc/modules-load.d/reality443.conf 2>/dev/null || \
-        printf 'tcp_bbr\n' > /etc/modules-load.d/reality443.conf 2>/dev/null || true
+    printf 'tcp_bbr\n' > /etc/modules-load.d/reality443.conf 2>/dev/null || true
     sysctl --system >/dev/null 2>&1 || true
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
     if [ "$cc" = "bbr" ]; then
-        ok "Kernel tuned (BBR + fq + enlarged socket buffers)"
+        ok "Kernel tuned for ${mem}MB RAM (BBR + fq + sized buffers)"
     else
-        warn "Kernel tuned, but congestion control is '${cc}' (BBR unavailable on this kernel)"
+        warn "Kernel tuned for ${mem}MB RAM, but congestion control is '${cc}'"
     fi
 }
 
 apply_limits() {
-    cat > "$LIMITS_FILE" <<'LIM'
-* soft nofile 1000000
-* hard nofile 1000000
-* soft nproc 1000000
-* hard nproc 1000000
-root soft nofile 1000000
-root hard nofile 1000000
+    local lim mem
+    mem=$(ram_mb)
+    if [ "$mem" -lt 2048 ]; then lim=200000
+    elif [ "$mem" -lt 8192 ]; then lim=500000
+    else lim=1000000; fi
+    cat > "$LIMITS_FILE" <<LIM
+* soft nofile ${lim}
+* hard nofile ${lim}
+* soft nproc ${lim}
+* hard nproc ${lim}
+root soft nofile ${lim}
+root hard nofile ${lim}
 LIM
     local d
     for d in "$NGINX_SERVICE" "$XUI_SERVICE"; do
         systemctl list-unit-files "${d}.service" >/dev/null 2>&1 || continue
         mkdir -p "/etc/systemd/system/${d}.service.d"
-        cat > "/etc/systemd/system/${d}.service.d/reality443-limits.conf" <<'DROPIN'
+        cat > "/etc/systemd/system/${d}.service.d/reality443-limits.conf" <<DROPIN
 [Service]
-LimitNOFILE=1000000
-LimitNPROC=1000000
+LimitNOFILE=${lim}
+LimitNPROC=${lim}
 DROPIN
     done
     mkdir -p /etc/systemd/system.conf.d
-    cat > /etc/systemd/system.conf.d/reality443-limits.conf <<'SYSD'
+    cat > /etc/systemd/system.conf.d/reality443-limits.conf <<SYSD
 [Manager]
-DefaultLimitNOFILE=1000000
-DefaultLimitNPROC=1000000
+DefaultLimitNOFILE=${lim}
+DefaultLimitNPROC=${lim}
 SYSD
     systemctl daemon-reload >/dev/null 2>&1 || true
-    ok "File descriptor limits raised to 1000000"
+    ok "File descriptor limits set to ${lim} (${mem}MB RAM)"
 }
 
 write_stream_conf() {
@@ -2570,76 +2764,4 @@ do_rollback() {
     c=$(ask "Restore database and nginx config? [y/N]" v_yn "no")
     [ "$c" = "yes" ] || { warn "Cancelled."; pause; return 0; }
     systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-    [ -f "${dir}/x-ui.db" ] && cp -a "${dir}/x-ui.db" "$DB_PATH"
-    restore_nginx_from "$dir"
-    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-    apply_nginx "" && ok "Rollback completed"
-    pause
-}
-
-main_menu() {
-    while true; do
-        header
-        line_c 0 "  1) Install  -  full automatic setup"
-        line_c 1 "  2) Add New Inbounds to 443"
-        line_c 2 "  3) Status and Diagnostics"
-        line_c 3 "  4) Restart Services"
-        line_c 4 "  5) Rollback Last Change"
-        line_c 5 "  6) Uninstall Everything"
-        line_c 6 "  0) Exit"
-        local ch
-        printf '%s  Choice%s: ' "$(next_c)" "$R"
-        IFS= read -r ch || ch=0
-        case "$ch" in
-            1) do_setup ;;
-            2) do_sync ;;
-            3) diagnose ;;
-            4) restart_services ;;
-            5) do_rollback ;;
-            6) do_uninstall ;;
-            0) clear; exit 0 ;;
-            *) err "Pick a number from the list."; pause ;;
-        esac
-    done
-}
-
-main() {
-    require_root
-    mkdir -p "$STATE_DIR" "$BACKUP_ROOT" "$LOG_DIR"
-    chmod 700 "$STATE_DIR" 2>/dev/null || true
-
-    acquire_lock || exit 1
-
-    ensure_deps
-    sync_nginx_paths
-    load_state
-
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --site) SITE_SRC_ARG="${2:-}"; shift 2 || shift ;;
-            *) break ;;
-        esac
-    done
-
-    case "${1:-}" in
-        --setup)     do_setup; exit 0 ;;
-        --install)   do_setup; exit 0 ;;
-        --sync)      do_sync; exit 0 ;;
-        --uninstall) do_uninstall; exit 0 ;;
-        --rollback)  do_rollback; exit 0 ;;
-        --diagnose)  diagnose; exit 0 ;;
-        --version)   printf 'reality-443 v%s\n' "$SCRIPT_VERSION"; exit 0 ;;
-    esac
-
-    if ! is_installed; then
-        clear
-        header
-        printf '%s ! No installation detected - starting full automatic setup %s\n' "$BG_WARN" "$R"
-        sleep 2
-        do_setup
-    fi
-
-    main_menu
-}
-
-main "$@"
+    [ -f "
