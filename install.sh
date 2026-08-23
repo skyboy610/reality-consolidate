@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="5.0.0"
-SELF_SRC="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
+SCRIPT_VERSION="5.1.0"
+SELF_SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${0:-}")"
 
 DB_PATH="${DB_PATH:-/etc/x-ui/x-ui.db}"
 STATE_DIR="/etc/reality443"
@@ -15,6 +15,7 @@ LOG_DIR="/var/log/reality443"
 LOG_FILE="${LOG_DIR}/reality443.log"
 LOCK_FILE="/run/reality443.lock"
 INSTALL_PATH="/usr/local/bin/reality-443.sh"
+WATCHDOG_PATH="/usr/local/bin/reality443-watchdog.sh"
 GUARD_NAME="reality443-guard"
 GUARD_UNIT="/etc/systemd/system/${GUARD_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-reality443.conf"
@@ -47,6 +48,7 @@ SITE_TARGET=""
 SITE_CERT=""
 SITE_KEY=""
 SITE_BIND_PORT=""
+SITE_SRC_ARG=""
 PANEL_ON_SITE="no"
 SUB_ON_SITE="no"
 
@@ -55,7 +57,6 @@ declare -A TAKEN_PORTS=()
 declare -a SEL_IDX=()
 declare -a PLAN_PORT=()
 ALLOC_PORT=""
-PORT_ALLOW=""
 PROMPT_IDX=0
 HOST_MECHANISM="external_proxy"
 STREAM_SO_CACHE=""
@@ -200,6 +201,12 @@ is_private_ip() {
 
 backend_ip() {
     if is_private_ip "$1"; then printf '%s\n' "$1"; else printf '127.0.0.1\n'; fi
+}
+
+is_installed() {
+    [ -f "$STREAM_FILE" ] || return 1
+    grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null || return 1
+    return 0
 }
 
 is_routable_listen() {
@@ -424,42 +431,8 @@ v_yn() {
     return 1
 }
 
-v_port() {
-    local x="${1:-}" own
-    if ! [[ "$x" =~ ^[0-9]+$ ]] || [ "$x" -lt 1 ] || [ "$x" -gt 65535 ]; then
-        err "Port must be a number between 1 and 65535."; return 1
-    fi
-    if [ "$x" -eq 443 ]; then err "Port 443 is reserved for the router."; return 1; fi
-    if [ -n "$PORT_ALLOW" ] && [ "$x" = "$PORT_ALLOW" ]; then printf '%s\n' "$x"; return 0; fi
-    if [ -n "${TAKEN_PORTS[$x]:-}" ]; then err "Port ${x} is already used in the panel."; return 1; fi
-    if port_busy "$x"; then
-        own=$(port_owner "$x"); [ -n "$own" ] || own="an unknown process"
-        err "Port ${x} is in use by ${own}."; return 1
-    fi
-    printf '%s\n' "$x"
-}
 
-v_port_list_ne() {
-    local x="${1:-}" t
-    [ -z "$x" ] && { err "Enter at least one port."; return 1; }
-    for t in $x; do
-        if ! [[ "$t" =~ ^[0-9]+$ ]] || [ "$t" -lt 1 ] || [ "$t" -gt 65535 ]; then
-            err "'${t}' is not a valid port."; return 1
-        fi
-    done
-    printf '%s\n' "$x"
-}
 
-v_port_list() {
-    local x="${1:-}" t
-    [ -z "$x" ] && { printf '\n'; return 0; }
-    for t in $x; do
-        if ! [[ "$t" =~ ^[0-9]+$ ]] || [ "$t" -lt 1 ] || [ "$t" -gt 65535 ]; then
-            err "'${t}' is not a valid port."; return 1
-        fi
-    done
-    printf '%s\n' "$x"
-}
 
 v_path() {
     local x="${1:-}"
@@ -1175,42 +1148,6 @@ auto_select_cert() {
     return 1
 }
 
-choose_cert_manual() {
-    local -a pairs=()
-    mapfile -t pairs < <(find_cert_pairs)
-    if [ "${#pairs[@]}" -eq 0 ]; then
-        warn "No certificate found under: ${CERT_SEARCH_DIRS}"
-        local c1 c2
-        c1=$(ask "Full path to fullchain certificate" v_path "")
-        c2=$(ask "Full path to private key" v_path "")
-        SITE_CERT="$c1"; SITE_KEY="$c2"
-        return 0
-    fi
-    step "Certificates on this server"
-    local k pd
-    for k in "${!pairs[@]}"; do
-        pd="${pairs[$k]%%|*}"
-        line_c "$k" "  $((k + 1))) ${pd}  ->  $(printf '%s' "${pairs[$k]}" | cut -d'|' -f2)"
-    done
-    line_c "${#pairs[@]}" "  0) Enter paths manually"
-    local pick
-    while true; do
-        printf '%s  Select%s: ' "$(next_c)" "$R"
-        IFS= read -r pick || pick=""
-        if [ "$pick" = "0" ]; then
-            local m1 m2
-            m1=$(ask "Full path to fullchain certificate" v_path "")
-            m2=$(ask "Full path to private key" v_path "")
-            SITE_CERT="$m1"; SITE_KEY="$m2"
-            return 0
-        fi
-        if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#pairs[@]}" ]; then
-            IFS='|' read -r _ SITE_CERT SITE_KEY <<< "${pairs[$((pick - 1))]}"
-            return 0
-        fi
-        err "Pick a number from the list."
-    done
-}
 
 pick_site_port() {
     local p="${SITE_PORT:-8081}" limit=$((SITE_PORT + 300))
@@ -1222,6 +1159,72 @@ pick_site_port() {
     done
     err "No free loopback port for the camouflage site."
     return 1
+}
+
+copy_site_files() {
+    local src="$1" srcdir n sz
+    [ -f "$src" ] || return 1
+    mkdir -p "$SITE_ROOT"
+    srcdir=$(dirname "$src")
+    if [ "$srcdir" = "$SITE_ROOT" ]; then
+        ok "Site files already in place"
+        return 0
+    fi
+    case "$srcdir" in
+        /|/root|/home|/etc|/usr|/var|/opt|/tmp|/srv|/boot)
+            warn "Source sits in a system directory - copying only index.html"
+            cp -f "$src" "${SITE_ROOT}/index.html" || return 1
+            return 0 ;;
+    esac
+    n=$(find "$srcdir" -type f 2>/dev/null | head -20001 | wc -l)
+    sz=$(du -sm "$srcdir" 2>/dev/null | awk '{print $1}')
+    [ -n "$sz" ] || sz=0
+    if [ "$n" -gt 20000 ] || [ "$sz" -gt 500 ]; then
+        warn "Source folder is large (${n} files, ${sz}MB) - copying only index.html"
+        cp -f "$src" "${SITE_ROOT}/index.html" || return 1
+        return 0
+    fi
+    info "Copying ${n} file(s) from ${srcdir}"
+    if ! timeout 120 cp -a "${srcdir}/." "$SITE_ROOT"/ 2>/dev/null; then
+        warn "Bulk copy failed or timed out - falling back to index.html only"
+        cp -f "$src" "${SITE_ROOT}/index.html" || return 1
+    fi
+    [ -f "${SITE_ROOT}/index.html" ] || cp -f "$src" "${SITE_ROOT}/index.html"
+    ok "Copied site files to ${SITE_ROOT}"
+    return 0
+}
+
+find_user_index() {
+    local c
+    for c in "${SITE_ROOT}/index.html" /var/www/html/index.html /usr/share/nginx/html/index.html; do
+        [ -f "$c" ] || continue
+        grep -qi 'Welcome to nginx' "$c" 2>/dev/null && continue
+        printf '%s\n' "$c"
+        return 0
+    done
+    return 1
+}
+
+setup_site_content() {
+    local src=""
+    if [ -n "${SITE_SRC_ARG:-}" ]; then
+        if [ -f "$SITE_SRC_ARG" ]; then
+            src="$SITE_SRC_ARG"
+            info "Using site file supplied on the command line"
+        else
+            warn "Supplied site file not found: ${SITE_SRC_ARG}"
+        fi
+    fi
+    [ -n "$src" ] || src=$(find_user_index || true)
+    if [ -n "$src" ]; then
+        copy_site_files "$src" || { warn "Falling back to built-in page"; generate_default_site; }
+    else
+        generate_default_site
+        ok "Built-in camouflage page generated"
+    fi
+    chown -R www-data:www-data "$SITE_ROOT" 2>/dev/null || chown -R nginx:nginx "$SITE_ROOT" 2>/dev/null || true
+    chmod -R a+rX "$SITE_ROOT" 2>/dev/null || true
+    return 0
 }
 
 generate_default_site() {
@@ -1403,32 +1406,103 @@ apply_site() {
 }
 
 install_self() {
-    if [ ! -f "$SELF_SRC" ]; then
-        err "Script was piped into bash. Save it to a file and run it from disk."
-        return 1
-    fi
-    if [ "$SELF_SRC" != "$INSTALL_PATH" ]; then
-        cp -f "$SELF_SRC" "$INSTALL_PATH" 2>/dev/null || return 1
-    fi
-    chmod 755 "$INSTALL_PATH"
+    [ -f "$SELF_SRC" ] || return 0
+    [ "$SELF_SRC" = "$INSTALL_PATH" ] && return 0
+    cp -f "$SELF_SRC" "$INSTALL_PATH" 2>/dev/null || return 0
+    chmod 755 "$INSTALL_PATH" 2>/dev/null || true
     ln -sf "$INSTALL_PATH" /usr/local/bin/reality443 2>/dev/null || true
     return 0
 }
 
+write_watchdog() {
+    mkdir -p "$LOG_DIR" "$(dirname "$WATCHDOG_PATH")"
+    cat > "$WATCHDOG_PATH" <<WDCONF
+#!/usr/bin/env bash
+set -uo pipefail
+ROUTED_FILE="${ROUTED_FILE}"
+STREAM_FILE="${STREAM_FILE}"
+NGINX_CONF="${NGINX_CONF}"
+LOG_FILE="${LOG_DIR}/watchdog.log"
+NGINX_SERVICE="${NGINX_SERVICE}"
+XUI_SERVICE="${XUI_SERVICE}"
+INTERVAL=${GUARD_INTERVAL}
+WDCONF
+    cat >> "$WATCHDOG_PATH" <<'WDBODY'
+LOCK_PATH=/run/reality443-watchdog.lock
+LOG_MAX=5242880
+
+exec 9>"$LOCK_PATH" 2>/dev/null || true
+flock -n 9 2>/dev/null || exit 0
+
+log() {
+    local sz
+    if [ -f "$LOG_FILE" ]; then
+        sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+        [ "$sz" -gt "$LOG_MAX" ] && mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
+    fi
+    { printf '%s|%s|%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG_FILE"; } 2>/dev/null || true
+}
+
+port_busy() { ss -Hltn "( sport = :$1 )" 2>/dev/null | grep -q .; }
+
+trap 'log INFO "watchdog stopping"; exit 0' TERM INT
+log INFO "watchdog started pid $$"
+
+cooldown=0
+while true; do
+    if ! systemctl is-active --quiet "$NGINX_SERVICE"; then
+        log WARN "nginx inactive - starting"
+        systemctl start "$NGINX_SERVICE" >/dev/null 2>&1
+    fi
+    if ! systemctl is-active --quiet "$XUI_SERVICE"; then
+        log WARN "x-ui inactive - starting"
+        systemctl start "$XUI_SERVICE" >/dev/null 2>&1
+    fi
+    if [ -f "$STREAM_FILE" ] && ! grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null; then
+        log ERROR "stream include missing from nginx.conf"
+    fi
+    if [ -f "$STREAM_FILE" ] && ! port_busy 443; then
+        log ERROR "port 443 not bound - restarting nginx"
+        systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1
+    fi
+    if [ "$cooldown" -gt 0 ]; then
+        cooldown=$((cooldown - 1))
+    elif [ -f "$ROUTED_FILE" ] && command -v jq >/dev/null 2>&1; then
+        miss=0
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            port_busy "$p" || miss=$((miss + 1))
+        done < <(jq -r '.[]' "$ROUTED_FILE" 2>/dev/null)
+        if [ "$miss" -gt 0 ]; then
+            log ERROR "$miss backend port(s) down - restarting x-ui"
+            systemctl restart "$XUI_SERVICE" >/dev/null 2>&1
+            cooldown=10
+        fi
+    fi
+    sleep "$INTERVAL"
+done
+WDBODY
+    chmod 755 "$WATCHDOG_PATH"
+    if ! bash -n "$WATCHDOG_PATH" 2>/dev/null; then
+        err "Generated watchdog has a syntax error"
+        return 1
+    fi
+    return 0
+}
+
 install_guard_service() {
-    install_self || { err "Could not install the script to ${INSTALL_PATH}"; return 1; }
-    mkdir -p "$LOG_DIR"
+    install_self
+    write_watchdog || return 1
     cat > "$GUARD_UNIT" <<UNIT
 [Unit]
 Description=Reality 443 SNI Router Watchdog
-Documentation=https://github.com/
 After=network-online.target nginx.service ${XUI_SERVICE}.service
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_PATH} --daemon
+ExecStart=${WATCHDOG_PATH}
 Restart=always
 RestartSec=10
 TimeoutStopSec=15
@@ -1454,9 +1528,9 @@ UNIT
         systemctl is-active --quiet "${GUARD_NAME}.service" && return 0
         sleep 1
     done
-    err "Watchdog service failed to start. Details:"
-    systemctl status "${GUARD_NAME}.service" --no-pager 2>&1 | tail -n 12 >&2
-    journalctl -u "${GUARD_NAME}.service" -n 15 --no-pager 2>&1 | tail -n 15 >&2
+    err "Watchdog failed to start:"
+    systemctl status "${GUARD_NAME}.service" --no-pager 2>&1 | tail -n 10 >&2
+    journalctl -u "${GUARD_NAME}.service" -n 12 --no-pager 2>&1 | tail -n 12 >&2
     return 1
 }
 
@@ -1508,52 +1582,6 @@ setup_firewall_auto() {
     return 0
 }
 
-guard_loop() {
-    local miss=0 cooldown=0 p
-    local -a want=()
-    log_write INFO "watchdog started (pid $$)"
-    trap 'log_write INFO "watchdog stopping"; exit 0' TERM INT
-    while true; do
-        load_state 2>/dev/null || true
-        sync_nginx_paths
-        if ! systemctl is-active --quiet "$NGINX_SERVICE"; then
-            log_write WARN "nginx inactive - starting"
-            systemctl start "$NGINX_SERVICE" >/dev/null 2>&1 || true
-        fi
-        if ! systemctl is-active --quiet "$XUI_SERVICE"; then
-            log_write WARN "x-ui inactive - starting"
-            systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-        fi
-        if [ -f "$STREAM_FILE" ] && ! grep -qF "$STREAM_FILE" "$NGINX_CONF" 2>/dev/null; then
-            log_write WARN "stream include missing - restoring"
-            if hook_stream_include && nginx -t >/dev/null 2>&1; then
-                systemctl reload "$NGINX_SERVICE" >/dev/null 2>&1 || true
-                log_write OK "stream include restored"
-            fi
-        fi
-        if [ -f "$STREAM_FILE" ] && ! port_busy 443; then
-            log_write ERROR "port 443 not bound - restarting nginx"
-            systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1 || true
-        fi
-        if [ "$cooldown" -gt 0 ]; then
-            cooldown=$((cooldown - 1))
-        elif [ -f "$ROUTED_FILE" ]; then
-            want=()
-            mapfile -t want < <(jq -r '.[]' "$ROUTED_FILE" 2>/dev/null || true)
-            miss=0
-            for p in "${want[@]}"; do
-                [ -n "$p" ] || continue
-                port_busy "$p" || miss=$((miss + 1))
-            done
-            if [ "$miss" -gt 0 ]; then
-                log_write ERROR "${miss} backend port(s) down - restarting x-ui"
-                systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
-                cooldown=10
-            fi
-        fi
-        sleep "$GUARD_INTERVAL"
-    done
-}
 
 verify_live() {
     local fails=0 eff i p
@@ -1708,7 +1736,7 @@ do_setup() {
     start_xui_and_wait "${wait_ports[@]}" || true
 
     step "[7/10] camouflage site"
-    generate_default_site
+    setup_site_content
     if [ -n "$SITE_CERT" ]; then
         pick_site_port || true
         SITE_BIND_PORT="$SITE_PORT"
@@ -1816,55 +1844,6 @@ do_sync() {
     pause
 }
 
-site_menu() {
-    while true; do
-        header
-        load_state
-        printf '%s  Mode        %s%s\n' "$C_TURQ" "$SITE_MODE" "$R"
-        [ -n "$DOMAIN" ] && printf '%s  Domain      %s%s\n' "$C_GOLD" "$DOMAIN" "$R"
-        [ -n "$SITE_CERT" ] && printf '%s  Certificate %s%s\n' "$C_MINT" "$SITE_CERT" "$R"
-        [ "$SITE_MODE" = "redirect" ] && printf '%s  Redirects   %s%s\n' "$C_ROSE" "$SITE_TARGET" "$R"
-        printf '%s  Panel/Sub   panel=%s  sub=%s%s\n\n' "$C_LILAC" "$PANEL_ON_SITE" "$SUB_ON_SITE" "$R"
-        line_c 0 "  1) Generate Built-in Camouflage Page"
-        line_c 1 "  2) Use Existing Local Files"
-        line_c 2 "  3) Redirect to Another Site"
-        line_c 3 "  4) Change Certificate"
-        line_c 4 "  5) Toggle Panel on Domain"
-        line_c 5 "  6) Toggle Subscription on Domain"
-        line_c 6 "  7) Disable Site"
-        line_c 7 "  0) Back"
-        local ch src
-        printf '%s  Choice%s: ' "$(next_c)" "$R"
-        IFS= read -r ch || ch=0
-        case "$ch" in
-            1) generate_default_site; SITE_MODE="local"; SITE_TARGET=""
-               apply_site && ok "Camouflage page is live"; pause ;;
-            2) src=$(ask "Full path to index.html" v_path "")
-               mkdir -p "$SITE_ROOT"
-               cp -a "$(dirname "$src")/." "$SITE_ROOT"/ 2>/dev/null || cp -a "$src" "${SITE_ROOT}/index.html"
-               [ -f "${SITE_ROOT}/index.html" ] || cp -a "$src" "${SITE_ROOT}/index.html"
-               chown -R www-data:www-data "$SITE_ROOT" 2>/dev/null || true
-               chmod -R a+rX "$SITE_ROOT" 2>/dev/null || true
-               SITE_MODE="local"; SITE_TARGET=""
-               apply_site && ok "Local site is live"; pause ;;
-            3) SITE_TARGET=$(ask "Redirect target domain" v_domain "$SITE_TARGET")
-               SITE_MODE="redirect"
-               apply_site && ok "Redirect is live"; pause ;;
-            4) choose_cert_manual && apply_site && ok "Certificate applied"; pause ;;
-            5) [ "$PANEL_ON_SITE" = "yes" ] && PANEL_ON_SITE="no" || PANEL_ON_SITE="yes"
-               [ "$PANEL_ON_SITE" = "yes" ] && ensure_panel_path >/dev/null
-               apply_site && ok "Panel on domain: ${PANEL_ON_SITE}"; pause ;;
-            6) [ "$SUB_ON_SITE" = "yes" ] && SUB_ON_SITE="no" || SUB_ON_SITE="yes"
-               apply_site && ok "Subscription on domain: ${SUB_ON_SITE}"; pause ;;
-            7) rm -f "$SITE_CONF"; SITE_MODE="none"; SITE_CERT=""; SITE_KEY=""
-               PANEL_ON_SITE="no"; SUB_ON_SITE="no"; save_state
-               load_inbounds; write_stream_conf >/dev/null 2>&1 || true
-               apply_nginx "" && ok "Site disabled"; pause ;;
-            0) return 0 ;;
-            *) err "Pick a number from the list."; pause ;;
-        esac
-    done
-}
 
 ssh_ports() {
     {
@@ -1887,183 +1866,9 @@ fw_allow() {
     return 1
 }
 
-setup_firewall() {
-    local -a detected=()
-    mapfile -t detected < <(ssh_ports)
-    local sp default_ssh answer
-    if [ "${#detected[@]}" -gt 0 ]; then
-        step "SSH ports detected"
-        for sp in "${detected[@]}"; do line_c 3 "  ${sp}"; done
-        default_ssh="${detected[*]}"
-    else
-        warn "Could not detect the SSH port automatically."
-        default_ssh="22"
-    fi
-    answer=$(ask "SSH port(s) to keep open" v_port_list_ne "$default_ssh")
-    local -a sports=()
-    read -ra sports <<< "$answer" || true
-    local pp sbp extra go
-    pp=$(panel_port); sbp=$(sub_port)
-    step "Ports to be opened"
-    for sp in "${sports[@]}"; do line_c 0 "  ${sp}      SSH"; done
-    line_c 1 "  80       http"
-    line_c 2 "  443/tcp  https / proxy"
-    line_c 3 "  443/udp  QUIC / Hysteria2 / TUIC"
-    line_c 4 "  ${pp}     x-ui panel"
-    line_c 5 "  ${sbp}     subscription"
-    extra=$(ask "Extra ports (space separated, blank for none)" v_port_list "")
-    go=$(ask "Enable the firewall with these rules? [y/N]" v_yn "no")
-    [ "$go" = "yes" ] || { warn "Firewall not changed."; return 0; }
 
-    have ufw || install_pkgs ufw || true
-    have ufw || { err "Could not install ufw."; return 1; }
 
-    local failed=0
-    for sp in "${sports[@]}"; do fw_allow "$sp" "SSH" || failed=$((failed + 1)); done
-    if [ "$failed" -gt 0 ]; then
-        err "SSH rules failed - refusing to enable the firewall."
-        return 1
-    fi
-    fw_allow 80 "http" || failed=$((failed + 1))
-    fw_allow 443 "https" || failed=$((failed + 1))
-    fw_allow 443 "quic" udp || failed=$((failed + 1))
-    fw_allow "$pp" "panel" || failed=$((failed + 1))
-    fw_allow "$sbp" "subscription" || failed=$((failed + 1))
-    local e
-    for e in $extra; do
-        fw_allow "$e" "extra" || failed=$((failed + 1))
-        fw_allow "$e" "extra" udp || true
-    done
-    if [ "$failed" -gt 0 ]; then
-        err "${failed} rule(s) failed - not enabling the firewall."
-        return 1
-    fi
-    ufw --force enable >/dev/null 2>&1 || { err "Could not enable ufw."; return 1; }
-    ufw status 2>/dev/null | grep -qi '^Status: active' || { err "ufw did not become active."; return 1; }
-    ok "Firewall is active and verified"
-    return 0
-}
 
-firewall_menu() {
-    while true; do
-        header
-        if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
-            printf '%s  Status  active%s\n\n' "$C_MINT" "$R"
-        else
-            printf '%s  Status  inactive%s\n\n' "$C_ROSE" "$R"
-        fi
-        line_c 0 "  1) Enable Firewall"
-        line_c 1 "  2) Disable Firewall"
-        line_c 2 "  3) Show Rules"
-        line_c 3 "  0) Back"
-        local ch c
-        printf '%s  Choice%s: ' "$(next_c)" "$R"
-        IFS= read -r ch || ch=0
-        case "$ch" in
-            1) setup_firewall; pause ;;
-            2) have ufw || { warn "ufw is not installed."; pause; continue; }
-               c=$(ask "Disable the firewall? [y/N]" v_yn "no")
-               [ "$c" = "yes" ] && { ufw disable >/dev/null 2>&1 && ok "Firewall disabled"; }
-               pause ;;
-            3) have ufw && ufw status verbose 2>/dev/null | sed -n '1,30p' || warn "ufw is not installed."; pause ;;
-            0) return 0 ;;
-            *) err "Pick a number from the list."; pause ;;
-        esac
-    done
-}
-
-panel_menu() {
-    while true; do
-        header
-        db_ready || { pause; return 0; }
-        load_state
-        refresh_taken_ports
-        printf '%s  Panel port         %s%s\n' "$C_TURQ" "$(panel_port)" "$R"
-        printf '%s  Panel base path    %s%s\n' "$C_GOLD" "$(panel_path)" "$R"
-        printf '%s  Subscription port  %s%s\n' "$C_MINT" "$(sub_port)" "$R"
-        printf '%s  Subscription path  %s%s\n\n' "$C_LILAC" "$(sub_path)" "$R"
-        line_c 0 "  1) Change Panel Port"
-        line_c 1 "  2) Change Subscription Port"
-        line_c 2 "  3) Regenerate Panel Base Path"
-        line_c 3 "  0) Back"
-        local ch np
-        printf '%s  Choice%s: ' "$(next_c)" "$R"
-        IFS= read -r ch || ch=0
-        case "$ch" in
-            1) PORT_ALLOW=$(panel_port)
-               np=$(ask "New panel port" v_port "$(panel_port)")
-               PORT_ALLOW=""
-               systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-               set_setting webPort "$np"
-               systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-               ok "Panel port set to ${np}"
-               [ -f "$SITE_CONF" ] && apply_site >/dev/null 2>&1
-               pause ;;
-            2) PORT_ALLOW=$(sub_port)
-               np=$(ask "New subscription port" v_port "$(sub_port)")
-               PORT_ALLOW=""
-               systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-               set_setting subPort "$np"
-               systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-               ok "Subscription port set to ${np}"
-               [ -f "$SITE_CONF" ] && apply_site >/dev/null 2>&1
-               pause ;;
-            3) local newp
-               newp="/panel$(rand_str 6)"
-               systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-               set_setting webBasePath "${newp}/"
-               systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-               ok "Panel base path is now ${newp}/"
-               [ -f "$SITE_CONF" ] && apply_site >/dev/null 2>&1
-               pause ;;
-            0) return 0 ;;
-            *) err "Pick a number from the list."; pause ;;
-        esac
-    done
-}
-
-services_menu() {
-    while true; do
-        header
-        printf '%s  x-ui      %s%s\n' "$C_TURQ" "$(systemctl is-active "$XUI_SERVICE" 2>/dev/null || echo inactive)" "$R"
-        printf '%s  nginx     %s%s\n' "$C_MINT" "$(systemctl is-active "$NGINX_SERVICE" 2>/dev/null || echo inactive)" "$R"
-        printf '%s  watchdog  %s%s\n\n' "$C_LILAC" "$(systemctl is-active "${GUARD_NAME}.service" 2>/dev/null || echo inactive)" "$R"
-        line_c 0 "  1) Restart All"
-        line_c 1 "  2) Restart nginx"
-        line_c 2 "  3) Reload nginx"
-        line_c 3 "  4) Restart x-ui"
-        line_c 4 "  5) Restart Watchdog"
-        line_c 5 "  6) Stop Watchdog"
-        line_c 6 "  7) Install / Repair Watchdog"
-        line_c 7 "  8) Test nginx Config"
-        line_c 8 "  9) Full Status"
-        line_c 9 "  0) Back"
-        local ch
-        printf '%s  Choice%s: ' "$(next_c)" "$R"
-        IFS= read -r ch || ch=0
-        case "$ch" in
-            1) systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 && ok "x-ui restarted" || err "x-ui restart failed"
-               systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1 && ok "nginx restarted" || err "nginx restart failed"
-               systemctl restart "${GUARD_NAME}.service" >/dev/null 2>&1 && ok "watchdog restarted" || true
-               pause ;;
-            2) systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1 && ok "nginx restarted" || err "nginx restart failed"; pause ;;
-            3) systemctl reload "$NGINX_SERVICE" >/dev/null 2>&1 && ok "nginx reloaded" || err "nginx reload failed"; pause ;;
-            4) systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 && ok "x-ui restarted" || err "x-ui restart failed"; pause ;;
-            5) systemctl restart "${GUARD_NAME}.service" >/dev/null 2>&1 && ok "watchdog restarted" || err "watchdog restart failed"; pause ;;
-            6) systemctl stop "${GUARD_NAME}.service" >/dev/null 2>&1 && warn "watchdog stopped" || true; pause ;;
-            7) install_guard_service && ok "Watchdog installed and enabled"; pause ;;
-            8) if nginx -t 2>&1 | sed 's/^/  /'; then ok "nginx config OK"; else err "nginx config has errors"; fi; pause ;;
-            9) systemctl status "$XUI_SERVICE" --no-pager 2>&1 | head -n 12
-               echo
-               systemctl status "$NGINX_SERVICE" --no-pager 2>&1 | head -n 12
-               echo
-               systemctl status "${GUARD_NAME}.service" --no-pager 2>&1 | head -n 12
-               pause ;;
-            0) return 0 ;;
-            *) err "Pick a number from the list."; pause ;;
-        esac
-    done
-}
 
 colorize_log() {
     local ln ts lvl msg
@@ -2080,33 +1885,6 @@ colorize_log() {
     done
 }
 
-logs_menu() {
-    while true; do
-        header
-        line_c 0 "  1) Last 40 Script Events"
-        line_c 1 "  2) Errors Only"
-        line_c 2 "  3) Warnings Only"
-        line_c 3 "  4) Watchdog Journal"
-        line_c 4 "  5) nginx Error Log"
-        line_c 5 "  6) x-ui Journal"
-        line_c 6 "  7) Clear Script Log"
-        line_c 7 "  0) Back"
-        local ch
-        printf '%s  Choice%s: ' "$(next_c)" "$R"
-        IFS= read -r ch || ch=0
-        case "$ch" in
-            1) [ -f "$LOG_FILE" ] && tail -n 40 "$LOG_FILE" | colorize_log || warn "No log yet."; pause ;;
-            2) [ -f "$LOG_FILE" ] && grep '|ERROR|' "$LOG_FILE" | tail -n 40 | colorize_log || warn "No errors."; pause ;;
-            3) [ -f "$LOG_FILE" ] && grep '|WARN|' "$LOG_FILE" | tail -n 40 | colorize_log || warn "No warnings."; pause ;;
-            4) journalctl -u "${GUARD_NAME}.service" -n 40 --no-pager 2>&1 | tail -n 40; pause ;;
-            5) [ -f /var/log/nginx/error.log ] && tail -n 40 /var/log/nginx/error.log || warn "No nginx error log."; pause ;;
-            6) journalctl -u "$XUI_SERVICE" -n 40 --no-pager 2>&1 | tail -n 40; pause ;;
-            7) : > "$LOG_FILE" 2>/dev/null || true; ok "Log cleared"; pause ;;
-            0) return 0 ;;
-            *) err "Pick a number from the list."; pause ;;
-        esac
-    done
-}
 
 diagnose() {
     header
@@ -2157,37 +1935,6 @@ diagnose() {
     pause
 }
 
-backup_menu() {
-    while true; do
-        header
-        line_c 0 "  1) Create Backup Now"
-        line_c 1 "  2) Rollback to Last Backup"
-        line_c 2 "  3) List Backups"
-        line_c 3 "  0) Back"
-        local ch dir c
-        printf '%s  Choice%s: ' "$(next_c)" "$R"
-        IFS= read -r ch || ch=0
-        case "$ch" in
-            1) dir=$(backup_now); ok "Backup created: ${dir}"; pause ;;
-            2) if [ ! -e "${BACKUP_ROOT}/latest" ]; then err "No backup found."; pause; continue; fi
-               dir=$(readlink -f "${BACKUP_ROOT}/latest")
-               c=$(ask "Restore database and nginx from ${dir}? [y/N]" v_yn "no")
-               [ "$c" = "yes" ] || { warn "Cancelled."; pause; continue; }
-               systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-               [ -f "${dir}/x-ui.db" ] && cp -a "${dir}/x-ui.db" "$DB_PATH"
-               restore_nginx_from "$dir"
-               systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
-               apply_nginx "" && ok "Rollback completed"
-               pause ;;
-            3) find "$BACKUP_ROOT" -maxdepth 1 -type d -name '20*' 2>/dev/null | sort | tail -n 20 | while IFS= read -r l; do
-                   printf '%s  %s%s\n' "$C_STEEL" "$(basename "$l")" "$R"
-               done
-               pause ;;
-            0) return 0 ;;
-            *) err "Pick a number from the list."; pause ;;
-        esac
-    done
-}
 
 do_uninstall() {
     header
@@ -2285,7 +2032,8 @@ do_uninstall() {
         fi
     fi
 
-    rm -f "$STATE_FILE" "$PORTS_FILE" "$ROUTED_FILE" "$LOCK_FILE"
+    rm -f "$STATE_FILE" "$PORTS_FILE" "$ROUTED_FILE" "$LOCK_FILE" "$WATCHDOG_PATH"
+    rm -f /run/reality443-watchdog.lock
     rm -rf "$LOG_DIR"
     rm -f /usr/local/bin/reality443
     DOMAIN=""; SITE_MODE="none"; SITE_CERT=""; SITE_KEY=""
@@ -2301,67 +2049,62 @@ do_uninstall() {
     pause
 }
 
-tuning_menu() {
-    while true; do
-        header
-        printf '%s  congestion   %s%s\n' "$C_TURQ" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo ?)" "$R"
-        printf '%s  qdisc        %s%s\n' "$C_MINT" "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo ?)" "$R"
-        printf '%s  file-max     %s%s\n' "$C_GOLD" "$(sysctl -n fs.file-max 2>/dev/null || echo ?)" "$R"
-        printf '%s  sysctl file  %s%s\n\n' "$C_LILAC" "$([ -f "$SYSCTL_FILE" ] && echo applied || echo absent)" "$R"
-        line_c 0 "  1) Apply Kernel + Socket Tuning"
-        line_c 1 "  2) Apply File Descriptor Limits"
-        line_c 2 "  3) Apply nginx Core Tuning"
-        line_c 3 "  4) Apply All"
-        line_c 4 "  5) Revert Tuning"
-        line_c 5 "  0) Back"
-        local ch
-        printf '%s  Choice%s: ' "$(next_c)" "$R"
-        IFS= read -r ch || ch=0
-        case "$ch" in
-            1) apply_sysctl; pause ;;
-            2) apply_limits; pause ;;
-            3) sync_nginx_paths; tune_nginx_main; apply_nginx "" && ok "nginx reloaded"; pause ;;
-            4) apply_sysctl; apply_limits; sync_nginx_paths; tune_nginx_main; apply_nginx "" && ok "All tuning applied"; pause ;;
-            5) rm -f "$SYSCTL_FILE" "$LIMITS_FILE" "$NGINX_TUNE"
-               sysctl --system >/dev/null 2>&1 || true
-               apply_nginx "" >/dev/null 2>&1 || true
-               warn "Tuning reverted"; pause ;;
-            0) return 0 ;;
-            *) err "Pick a number from the list."; pause ;;
-        esac
-    done
+
+restart_services() {
+    header
+    step "Restarting services"
+    systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 && ok "x-ui restarted" || err "x-ui restart failed"
+    systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1 && ok "nginx restarted" || err "nginx restart failed"
+    if systemctl list-unit-files "${GUARD_NAME}.service" >/dev/null 2>&1; then
+        systemctl restart "${GUARD_NAME}.service" >/dev/null 2>&1 && ok "watchdog restarted" || warn "watchdog not installed"
+    fi
+    echo
+    printf '%s  x-ui      %s%s\n' "$C_TURQ" "$(systemctl is-active "$XUI_SERVICE" 2>/dev/null || echo inactive)" "$R"
+    printf '%s  nginx     %s%s\n' "$C_MINT" "$(systemctl is-active "$NGINX_SERVICE" 2>/dev/null || echo inactive)" "$R"
+    printf '%s  watchdog  %s%s\n' "$C_LILAC" "$(systemctl is-active "${GUARD_NAME}.service" 2>/dev/null || echo inactive)" "$R"
+    pause
+}
+
+do_rollback() {
+    header
+    if [ ! -e "${BACKUP_ROOT}/latest" ]; then
+        err "No backup found."
+        pause; return 0
+    fi
+    local dir c
+    dir=$(readlink -f "${BACKUP_ROOT}/latest")
+    step "Rollback"
+    info "Restoring from ${dir}"
+    c=$(ask "Restore database and nginx config? [y/N]" v_yn "no")
+    [ "$c" = "yes" ] || { warn "Cancelled."; pause; return 0; }
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+    [ -f "${dir}/x-ui.db" ] && cp -a "${dir}/x-ui.db" "$DB_PATH"
+    restore_nginx_from "$dir"
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+    apply_nginx "" && ok "Rollback completed"
+    pause
 }
 
 main_menu() {
     while true; do
         header
-        line_c 0  "  1) Install / Setup 443 Routing"
-        line_c 1  "  2) Sync Inbounds"
-        line_c 2  "  3) Camouflage Site"
-        line_c 3  "  4) Panel and Ports"
-        line_c 4  "  5) Performance Tuning"
-        line_c 5  "  6) Firewall"
-        line_c 6  "  7) Services and Watchdog"
-        line_c 7  "  8) Diagnose"
-        line_c 8  "  9) Logs"
-        line_c 9  " 10) Backup and Rollback"
-        line_c 10 " 11) Full Uninstall"
-        line_c 11 "  0) Exit"
+        line_c 0 "  1) Install  -  full automatic setup"
+        line_c 1 "  2) Add New Inbounds to 443"
+        line_c 2 "  3) Status and Diagnostics"
+        line_c 3 "  4) Restart Services"
+        line_c 4 "  5) Rollback Last Change"
+        line_c 5 "  6) Uninstall Everything"
+        line_c 6 "  0) Exit"
         local ch
         printf '%s  Choice%s: ' "$(next_c)" "$R"
         IFS= read -r ch || ch=0
         case "$ch" in
             1) do_setup ;;
             2) do_sync ;;
-            3) site_menu ;;
-            4) panel_menu ;;
-            5) tuning_menu ;;
-            6) firewall_menu ;;
-            7) services_menu ;;
-            8) diagnose ;;
-            9) logs_menu ;;
-            10) backup_menu ;;
-            11) do_uninstall ;;
+            3) diagnose ;;
+            4) restart_services ;;
+            5) do_rollback ;;
+            6) do_uninstall ;;
             0) clear; exit 0 ;;
             *) err "Pick a number from the list."; pause ;;
         esac
@@ -2373,17 +2116,6 @@ main() {
     mkdir -p "$STATE_DIR" "$BACKUP_ROOT" "$LOG_DIR"
     chmod 700 "$STATE_DIR" 2>/dev/null || true
 
-    if [ "${1:-}" = "--daemon" ]; then
-        exec 9>"$LOCK_FILE"
-        if ! flock -n 9; then
-            log_write WARN "another watchdog instance is running - exiting"
-            exit 0
-        fi
-        sync_nginx_paths
-        guard_loop
-        exit 0
-    fi
-
     exec 8>"${LOCK_FILE}.ui"
     if ! flock -n 8; then
         err "Another instance of this script is already running."
@@ -2394,13 +2126,30 @@ main() {
     sync_nginx_paths
     load_state
 
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --site) SITE_SRC_ARG="${2:-}"; shift 2 || shift ;;
+            *) break ;;
+        esac
+    done
+
     case "${1:-}" in
         --setup)     do_setup; exit 0 ;;
+        --install)   do_setup; exit 0 ;;
         --sync)      do_sync; exit 0 ;;
         --uninstall) do_uninstall; exit 0 ;;
+        --rollback)  do_rollback; exit 0 ;;
         --diagnose)  diagnose; exit 0 ;;
         --version)   printf 'reality-443 v%s\n' "$SCRIPT_VERSION"; exit 0 ;;
     esac
+
+    if ! is_installed; then
+        clear
+        header
+        printf '%s ! No installation detected - starting full automatic setup %s\n' "$BG_WARN" "$R"
+        sleep 2
+        do_setup
+    fi
 
     main_menu
 }
