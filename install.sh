@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
+# INTEGRITY_MARKER_EOF_CHECK
 set -euo pipefail
 
-SCRIPT_VERSION="5.9.0"
+_integrity() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    if [ -f "$src" ] && [ -r "$src" ]; then
+        if ! tail -n5 "$src" 2>/dev/null | grep -q '^# END_OF_SCRIPT$'; then
+            printf '\033[48;5;124m\033[38;5;255m ✗ Script file is incomplete (download was truncated). Re-download and try again. \033[0m\n' >&2
+            exit 99
+        fi
+    fi
+}
+_integrity
+
+SCRIPT_VERSION="6.0.0"
 SELF_SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${0:-}")"
 
 DB_PATH="${DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -2753,15 +2765,4 @@ restart_services() {
 
 do_rollback() {
     header
-    if [ ! -e "${BACKUP_ROOT}/latest" ]; then
-        err "No backup found."
-        pause; return 0
-    fi
-    local dir c
-    dir=$(readlink -f "${BACKUP_ROOT}/latest")
-    step "Rollback"
-    info "Restoring from ${dir}"
-    c=$(ask "Restore database and nginx config? [y/N]" v_yn "no")
-    [ "$c" = "yes" ] || { warn "Cancelled."; pause; return 0; }
-    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-    [ -f "
+    if [ ! -e "${BACKU
