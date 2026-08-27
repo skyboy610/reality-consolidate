@@ -2760,4 +2760,292 @@ reopen_all_inbound_ports() {
     local -a plist=()
     mapfile -t plist < <(collect_open_ports)
     local sp n=0
-    for sp in "${
+    for sp in "${plist[@]}"; do
+        [ -n "$sp" ] || continue
+        [ "$sp" -ge 1 ] 2>/dev/null || continue
+        [ "$sp" -le 65535 ] || continue
+        ufw allow "${sp}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${sp}/udp" >/dev/null 2>&1 || true
+        n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && ok "Firewall reopened for ${n} restored port(s)"
+    return 0
+}
+
+restore_inbounds() {
+    db_ready || { warn "Database unreachable - inbounds not restored"; return 1; }
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+
+    if [ -f "$PORTS_FILE" ]; then
+        local n i id lst prt
+        n=$(jq 'length' "$PORTS_FILE" 2>/dev/null || echo 0)
+        for ((i = 0; i < n; i++)); do
+            id=$(jq -r ".[$i].id" "$PORTS_FILE")
+            lst=$(jq -r ".[$i].listen // \"\"" "$PORTS_FILE")
+            prt=$(jq -r ".[$i].port" "$PORTS_FILE")
+            [ -n "$id" ] || continue
+            xsql "UPDATE inbounds SET listen='$(esc "$lst")', port=${prt} WHERE id=${id};" || true
+        done
+        ok "Restored original listen address and port for ${n} inbound(s)"
+    else
+        warn "No original-ports record found"
+    fi
+
+    clear_external_proxy
+
+    local hn=0 hid d c
+    if [ -f "$HOSTS_FILE" ]; then
+        while IFS= read -r hid; do
+            [ -n "$hid" ] || continue
+            [[ "$hid" =~ ^[0-9]+$ ]] || continue
+            xsql "DELETE FROM hosts WHERE id=${hid};" || true
+            hn=$((hn + 1))
+        done < <(jq -r '.[]' "$HOSTS_FILE" 2>/dev/null)
+    fi
+    for d in "$DOMAIN" "$SUB_DOMAIN"; do
+        [ -n "$d" ] || continue
+        c=$(xval "SELECT COUNT(*) FROM hosts WHERE address='$(esc "$d")';" 2>/dev/null || echo 0)
+        [ -n "$c" ] || c=0
+        if [ "$c" -gt 0 ]; then
+            xsql "DELETE FROM hosts WHERE address='$(esc "$d")';" || true
+            hn=$((hn + c))
+        fi
+    done
+    if [ "$hn" -gt 0 ]; then
+        ok "Removed ${hn} host row(s) created by this script"
+    else
+        info "No host rows to remove"
+    fi
+
+    unbind_loopback_inbounds
+    reopen_all_inbound_ports
+
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+    sleep 3
+    if systemctl is-active --quiet "$XUI_SERVICE"; then
+        ok "x-ui restarted - inbounds are live again"
+    else
+        err "x-ui did not start - run: systemctl status ${XUI_SERVICE}"
+    fi
+
+    local json n2 i2 rem2 lst2 prt2
+    json=$(q "SELECT remark, listen, port FROM inbounds WHERE enable=1 OR enable IS NULL;")
+    n2=$(printf '%s' "$json" | jq 'length')
+    echo
+    step "Inbound state after restore"
+    for ((i2 = 0; i2 < n2; i2++)); do
+        rem2=$(printf '%s' "$json" | jq -r ".[$i2].remark // \"\"")
+        lst2=$(printf '%s' "$json" | jq -r ".[$i2].listen // \"\"")
+        prt2=$(printf '%s' "$json" | jq -r ".[$i2].port")
+        if port_busy "$prt2"; then
+            ok "${rem2}  ${lst2:-0.0.0.0}:${prt2}  listening"
+        else
+            err "${rem2}  ${lst2:-0.0.0.0}:${prt2}  NOT listening"
+        fi
+    done
+    return 0
+}
+
+do_uninstall() {
+    header
+    step "Full uninstall"
+    line_c 0 "  - stop and disable the watchdog service"
+    line_c 1 "  - remove systemd units and drop-ins"
+    line_c 2 "  - remove all nginx files created by this script"
+    line_c 3 "  - restore original inbound ports"
+    line_c 4 "  - remove host rows created by this script"
+    line_c 5 "  - remove sysctl, limits and cron entries"
+    line_c 6 "  - remove state, logs and backups"
+    echo
+    local c; c=$(ask "Proceed with full uninstall? [y/N]" v_yn "no")
+    [ "$c" = "yes" ] || { warn "Cancelled."; pause; return 0; }
+    local wipe; wipe=$(ask "Also delete website files in ${SITE_ROOT}? [y/N]" v_yn "no")
+
+    load_state
+    sync_nginx_paths
+    backup_now >/dev/null
+
+    systemctl stop "${GUARD_NAME}.service" >/dev/null 2>&1 || true
+    systemctl disable "${GUARD_NAME}.service" >/dev/null 2>&1 || true
+    rm -f "$GUARD_UNIT"
+    rm -f /etc/systemd/system/"${NGINX_SERVICE}".service.d/reality443-limits.conf
+    rm -f /etc/systemd/system/"${XUI_SERVICE}".service.d/reality443-limits.conf
+    rmdir /etc/systemd/system/"${NGINX_SERVICE}".service.d 2>/dev/null || true
+    rmdir /etc/systemd/system/"${XUI_SERVICE}".service.d 2>/dev/null || true
+    rm -f /etc/systemd/system.conf.d/reality443-limits.conf
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    ok "Systemd units removed"
+
+    if crontab -l >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v 'reality443\|reality-443' | crontab - 2>/dev/null || true
+    fi
+    rm -f /etc/cron.d/reality443 2>/dev/null || true
+    ok "Cron entries removed"
+
+    step "Restoring inbounds"
+    restore_inbounds || true
+
+    unhook_stream_include
+    rm -f "$STREAM_FILE" "$SITE_CONF" "$NGINX_TUNE"
+    local f base
+    if [ -d "$DISABLED_DIR" ]; then
+        for f in "$DISABLED_DIR"/*; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            if [ "$base" = "default.conf" ]; then
+                mv -f "$f" "${NGINX_DIR}/conf.d/${base}"
+            else
+                mkdir -p "${NGINX_DIR}/sites-enabled"
+                mv -f "$f" "${NGINX_DIR}/sites-enabled/${base}"
+            fi
+        done
+        rmdir "$DISABLED_DIR" 2>/dev/null || true
+        ok "Original nginx sites restored"
+    fi
+    ok "nginx files removed"
+
+    rm -f "$SYSCTL_FILE" "$LIMITS_FILE" /etc/modules-load.d/reality443.conf
+    sysctl --system >/dev/null 2>&1 || true
+    ok "Kernel tuning reverted"
+
+    [ "$wipe" = "yes" ] && [ -d "$SITE_ROOT" ] && { rm -rf "${SITE_ROOT:?}"; ok "Website files deleted"; }
+
+    if have nginx; then
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload "$NGINX_SERVICE" 2>/dev/null || systemctl restart "$NGINX_SERVICE" 2>/dev/null || true
+            ok "nginx reloaded"
+        else
+            err "nginx config invalid after removal - check manually"
+        fi
+    fi
+
+    rm -f "$STATE_FILE" "$PORTS_FILE" "$ROUTED_FILE" "$HOSTS_FILE" "$LOCK_FILE" "$WATCHDOG_PATH"
+    rm -f /run/reality443-watchdog.lock
+    rm -rf "$LOG_DIR"
+    rm -f /usr/local/bin/reality443
+    DOMAIN=""; SITE_MODE="none"; SITE_CERT=""; SITE_KEY=""
+    PANEL_ON_SITE="no"; SUB_ON_SITE="no"
+    SUB_DOMAIN=""; SUB_CERT=""; SUB_KEY=""; SUB_BIND_PORT=""
+
+    echo
+    printf '%s ✓ Uninstall completed successfully %s\n' "$BG_OK" "$R"
+    printf '%s ✓ System restored to pre-install state %s\n' "$BG_OK" "$R"
+    echo
+    printf '%s  Backups kept at %s%s\n' "$C_SLATE" "$BACKUP_ROOT" "$R"
+    printf '%s  Script binary kept at %s%s\n' "$C_SLATE" "$INSTALL_PATH" "$R"
+    echo
+    pause
+}
+
+
+restart_services() {
+    header
+    step "Restarting services"
+    systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 && ok "x-ui restarted" || err "x-ui restart failed"
+    systemctl restart "$NGINX_SERVICE" >/dev/null 2>&1 && ok "nginx restarted" || err "nginx restart failed"
+    if systemctl list-unit-files "${GUARD_NAME}.service" >/dev/null 2>&1; then
+        systemctl restart "${GUARD_NAME}.service" >/dev/null 2>&1 && ok "watchdog restarted" || warn "watchdog not installed"
+    fi
+    echo
+    printf '%s  x-ui      %s%s\n' "$C_TURQ" "$(systemctl is-active "$XUI_SERVICE" 2>/dev/null || echo inactive)" "$R"
+    printf '%s  nginx     %s%s\n' "$C_MINT" "$(systemctl is-active "$NGINX_SERVICE" 2>/dev/null || echo inactive)" "$R"
+    printf '%s  watchdog  %s%s\n' "$C_LILAC" "$(systemctl is-active "${GUARD_NAME}.service" 2>/dev/null || echo inactive)" "$R"
+    pause
+}
+
+do_rollback() {
+    header
+    if [ ! -e "${BACKUP_ROOT}/latest" ]; then
+        err "No backup found."
+        pause; return 0
+    fi
+    local dir c
+    dir=$(readlink -f "${BACKUP_ROOT}/latest")
+    step "Rollback"
+    info "Restoring from ${dir}"
+    c=$(ask "Restore database and nginx config? [y/N]" v_yn "no")
+    [ "$c" = "yes" ] || { warn "Cancelled."; pause; return 0; }
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+    [ -f "${dir}/x-ui.db" ] && cp -a "${dir}/x-ui.db" "$DB_PATH"
+    restore_nginx_from "$dir"
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || true
+    apply_nginx "" && ok "Rollback completed"
+    pause
+}
+
+main_menu() {
+    while true; do
+        header
+        line_c 0 "  1) Install  -  full automatic setup"
+        line_c 1 "  2) Add New Inbounds to 443"
+        line_c 2 "  3) Status and Diagnostics"
+        line_c 3 "  4) Restart Services"
+        line_c 4 "  5) Rollback Last Change"
+        line_c 5 "  6) Uninstall Everything"
+        line_c 6 "  0) Exit"
+        local ch
+        printf '%s  Choice%s: ' "$(next_c)" "$R"
+        IFS= read -r ch || ch=0
+        case "$ch" in
+            1) do_setup ;;
+            2) do_sync ;;
+            3) diagnose ;;
+            4) restart_services ;;
+            5) do_rollback ;;
+            6) do_uninstall ;;
+            0) clear; exit 0 ;;
+            *) err "Pick a number from the list."; pause ;;
+        esac
+    done
+}
+
+main() {
+    require_root
+    mkdir -p "$STATE_DIR" "$BACKUP_ROOT" "$LOG_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+    acquire_lock || exit 1
+
+    ensure_deps
+    sync_nginx_paths
+    load_state
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --site) SITE_SRC_ARG="${2:-}"; shift 2 || shift ;;
+            *) break ;;
+        esac
+    done
+
+    case "${1:-}" in
+        --setup)     do_setup; exit 0 ;;
+        --install)   do_setup; exit 0 ;;
+        --sync)      do_sync; exit 0 ;;
+        --uninstall) do_uninstall; exit 0 ;;
+        --rollback)  do_rollback; exit 0 ;;
+        --diagnose)  diagnose; exit 0 ;;
+        --version)   printf 'reality-443 v%s\n' "$SCRIPT_VERSION"; exit 0 ;;
+    esac
+
+    if ! is_installed; then
+        clear
+        header
+        printf '%s ! No installation detected %s\n\n' "$BG_WARN" "$R"
+        line_c 0 "  Full automatic setup starts in 6 seconds."
+        line_c 1 "  Press any key to open the menu instead."
+        echo
+        local _k=""
+        if [ -t 0 ] && read -r -n 1 -t 6 _k 2>/dev/null; then
+            echo
+            info "Opening menu"
+        else
+            echo
+            do_setup
+        fi
+    fi
+
+    main_menu
+}
+
+main "$@"
+# END_OF_SCRIPT
