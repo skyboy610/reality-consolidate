@@ -36,6 +36,13 @@ class Srevc_Settings {
 		$exclude_via = Srevc_Query::split_list( $exclude_via );
 		$output['exclude_via'] = array_map( 'sanitize_key', $exclude_via );
 
+		$manual_via = isset( $input['manual_via'] ) ? sanitize_text_field( $input['manual_via'] ) : '';
+		$manual_via = Srevc_Query::split_list( $manual_via );
+		$output['manual_via'] = empty( $manual_via ) ? 'admin' : implode( ', ', array_map( 'sanitize_key', $manual_via ) );
+
+		$window = isset( $input['cleanup_window'] ) ? absint( $input['cleanup_window'] ) : 3;
+		$output['cleanup_window'] = min( 30, max( 0, $window ) );
+
 		$output['exclude_zero']           = empty( $input['exclude_zero'] ) ? 0 : 1;
 		$output['exclude_wallet_payment'] = empty( $input['exclude_wallet_payment'] ) ? 0 : 1;
 		$output['divide_by_ten']          = empty( $input['divide_by_ten'] ) ? 0 : 1;
@@ -89,10 +96,24 @@ class Srevc_Settings {
 						</td>
 					</tr>
 					<tr>
-						<th scope="row"><span class="srevc-label-purple"><?php esc_html_e( 'حذف تراکنش‌های دستی', 'site-revenue-calculator' ); ?></span></th>
+						<th scope="row"><span class="srevc-label-purple"><?php esc_html_e( 'حذف از محاسبه بر اساس منبع', 'site-revenue-calculator' ); ?></span></th>
 						<td>
-							<input type="text" class="regular-text ltr" dir="ltr" name="<?php echo esc_attr( SREVC_OPTION ); ?>[exclude_via]" value="<?php echo esc_attr( implode( ', ', (array) $settings['exclude_via'] ) ); ?>" />
-							<p class="description srevc-hint"><?php esc_html_e( 'مقدار created_via سفارش‌هایی که نباید محاسبه شوند. مقدار admin یعنی سفارش‌هایی که مدیر دستی در پیشخوان ثبت کرده است.', 'site-revenue-calculator' ); ?></p>
+							<input type="text" class="regular-text ltr" dir="ltr" name="<?php echo esc_attr( SREVC_OPTION ); ?>[exclude_via]" value="<?php echo esc_attr( implode( ', ', (array) $settings['exclude_via'] ) ); ?>" placeholder="admin" />
+							<p class="description srevc-hint"><?php esc_html_e( 'مقدار created_via سفارش‌هایی که نباید محاسبه شوند. خالی یعنی همه سفارش‌ها از جمله سفارش‌های دستی مدیر محاسبه می‌شوند. اگر admin بنویسید، سفارش‌های دستی مدیر از محاسبه کنار گذاشته می‌شوند.', 'site-revenue-calculator' ); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row"><span class="srevc-label-orange"><?php esc_html_e( 'منبع سفارش دستی', 'site-revenue-calculator' ); ?></span></th>
+						<td>
+							<input type="text" class="regular-text ltr" dir="ltr" name="<?php echo esc_attr( SREVC_OPTION ); ?>[manual_via]" value="<?php echo esc_attr( $settings['manual_via'] ); ?>" />
+							<p class="description srevc-hint"><?php esc_html_e( 'مقدار created_via که یعنی سفارش را مدیر دستی ساخته است. مبنای برچسب «سفارش دستی مدیر» در گزارش و مبنای ابزار پاک‌سازی سفارش‌های تکراری.', 'site-revenue-calculator' ); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row"><span class="srevc-label-pink"><?php esc_html_e( 'بازه تطبیق سفارش تکراری', 'site-revenue-calculator' ); ?></span></th>
+						<td>
+							<input type="number" class="small-text" min="0" max="30" name="<?php echo esc_attr( SREVC_OPTION ); ?>[cleanup_window]" value="<?php echo esc_attr( (int) $settings['cleanup_window'] ); ?>" />
+							<span class="srevc-hint"><?php esc_html_e( 'روز — سفارش‌های همان مشتری در این فاصله زمانی قبل و بعد از سفارش دستی، به عنوان تکراری احتمالی نمایش داده می‌شوند.', 'site-revenue-calculator' ); ?></span>
 						</td>
 					</tr>
 					<tr>

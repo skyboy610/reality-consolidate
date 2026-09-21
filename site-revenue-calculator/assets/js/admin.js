@@ -310,6 +310,16 @@
 			hidePicker();
 		} );
 
+		document.addEventListener( 'click', function ( event ) {
+			var target = event.target.closest ? event.target.closest( '[data-srevc-confirm]' ) : null;
+			if ( ! target ) {
+				return;
+			}
+			if ( ! window.confirm( target.getAttribute( 'data-srevc-confirm' ) ) ) {
+				event.preventDefault();
+			}
+		} );
+
 		var chips = document.querySelectorAll( '.srevc-chip input[type="radio"]' );
 		Array.prototype.forEach.call( chips, function ( radio ) {
 			radio.addEventListener( 'change', function () {

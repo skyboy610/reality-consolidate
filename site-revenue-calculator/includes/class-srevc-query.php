@@ -38,32 +38,73 @@ class Srevc_Query {
 		$status_sql = self::placeholders( $statuses );
 
 		if ( self::is_hpos() ) {
-			$table = $wpdb->prefix . 'wc_orders';
-			$sql   = "SELECT o.id AS order_id, o.total_amount AS order_total, o.created_via AS created_via, o.payment_method AS payment_method, o.date_created_gmt AS date_created_gmt
-				FROM {$table} o
+			$orders_table = $wpdb->prefix . 'wc_orders';
+			$op_table     = $wpdb->prefix . 'wc_order_operational_data';
+			$sql          = "SELECT o.id AS order_id, o.total_amount AS order_total, od.created_via AS created_via, o.payment_method AS payment_method, o.payment_method_title AS payment_method_title, o.customer_id AS customer_id, o.billing_email AS billing_email, o.date_created_gmt AS date_created_gmt
+				FROM {$orders_table} o
+				LEFT JOIN {$op_table} od ON ( od.order_id = o.id )
 				WHERE o.type = %s
 				AND o.status IN ( {$status_sql} )
 				AND o.date_created_gmt >= %s
 				AND o.date_created_gmt <= %s
 				ORDER BY o.date_created_gmt ASC";
-			$args  = array_merge( array( 'shop_order' ), $statuses, array( $start_gmt, $end_gmt ) );
 		} else {
-			$sql  = "SELECT p.ID AS order_id, total_meta.meta_value AS order_total, via_meta.meta_value AS created_via, pay_meta.meta_value AS payment_method, p.post_date_gmt AS date_created_gmt
+			$sql = "SELECT p.ID AS order_id, total_meta.meta_value AS order_total, via_meta.meta_value AS created_via, pay_meta.meta_value AS payment_method, title_meta.meta_value AS payment_method_title, user_meta.meta_value AS customer_id, email_meta.meta_value AS billing_email, p.post_date_gmt AS date_created_gmt
 				FROM {$wpdb->posts} p
 				INNER JOIN {$wpdb->postmeta} total_meta ON ( total_meta.post_id = p.ID AND total_meta.meta_key = '_order_total' )
 				LEFT JOIN {$wpdb->postmeta} via_meta ON ( via_meta.post_id = p.ID AND via_meta.meta_key = '_created_via' )
 				LEFT JOIN {$wpdb->postmeta} pay_meta ON ( pay_meta.post_id = p.ID AND pay_meta.meta_key = '_payment_method' )
+				LEFT JOIN {$wpdb->postmeta} title_meta ON ( title_meta.post_id = p.ID AND title_meta.meta_key = '_payment_method_title' )
+				LEFT JOIN {$wpdb->postmeta} user_meta ON ( user_meta.post_id = p.ID AND user_meta.meta_key = '_customer_user' )
+				LEFT JOIN {$wpdb->postmeta} email_meta ON ( email_meta.post_id = p.ID AND email_meta.meta_key = '_billing_email' )
 				WHERE p.post_type = %s
 				AND p.post_status IN ( {$status_sql} )
 				AND p.post_date_gmt >= %s
 				AND p.post_date_gmt <= %s
 				ORDER BY p.post_date_gmt ASC";
-			$args = array_merge( array( 'shop_order' ), $statuses, array( $start_gmt, $end_gmt ) );
 		}
 
+		$args = array_merge( array( 'shop_order' ), $statuses, array( $start_gmt, $end_gmt ) );
 		$rows = $wpdb->get_results( self::prepare( $sql, $args ) );
 
 		return is_array( $rows ) ? $rows : array();
+	}
+
+	protected static function coupon_data( $order_ids ) {
+		global $wpdb;
+
+		$coupons = array();
+		if ( empty( $order_ids ) ) {
+			return $coupons;
+		}
+
+		$items_table    = $wpdb->prefix . 'woocommerce_order_items';
+		$itemmeta_table = $wpdb->prefix . 'woocommerce_order_itemmeta';
+		$chunks         = array_chunk( array_map( 'absint', $order_ids ), 500 );
+
+		foreach ( $chunks as $chunk ) {
+			$id_sql = self::placeholders( $chunk, '%d' );
+			$sql    = "SELECT oi.order_id AS order_id, oi.order_item_name AS code, im.meta_value AS discount
+				FROM {$items_table} oi
+				LEFT JOIN {$itemmeta_table} im ON ( im.order_item_id = oi.order_item_id AND im.meta_key = %s )
+				WHERE oi.order_id IN ( {$id_sql} )
+				AND oi.order_item_type = %s";
+			$args   = array_merge( array( 'discount_amount' ), $chunk, array( 'coupon' ) );
+			$rows   = $wpdb->get_results( self::prepare( $sql, $args ) );
+
+			foreach ( (array) $rows as $row ) {
+				$id = (int) $row->order_id;
+				if ( ! isset( $coupons[ $id ] ) ) {
+					$coupons[ $id ] = array();
+				}
+				$coupons[ $id ][] = array(
+					'code'     => (string) $row->code,
+					'discount' => (float) $row->discount,
+				);
+			}
+		}
+
+		return $coupons;
 	}
 
 	protected static function wallet_order_ids( $order_ids, $keywords, $product_ids ) {
@@ -133,7 +174,7 @@ class Srevc_Query {
 			'start'                  => '',
 			'end'                    => '',
 			'statuses'               => array( 'wc-completed' ),
-			'exclude_via'            => array( 'admin' ),
+			'exclude_via'            => array(),
 			'exclude_zero'           => true,
 			'wallet_keywords'        => array(),
 			'wallet_products'        => array(),
@@ -152,15 +193,14 @@ class Srevc_Query {
 
 		$rows = self::fetch_orders( $start_gmt, $end_gmt, $statuses );
 
-		$exclude_via   = array_map( 'strtolower', array_map( 'trim', (array) $args['exclude_via'] ) );
-		$gateways      = array_map( 'strtolower', array_map( 'trim', (array) $args['wallet_gateways'] ) );
-		$keywords      = (array) $args['wallet_keywords'];
-		$products      = array_map( 'absint', (array) $args['wallet_products'] );
-		$products      = array_values( array_filter( $products ) );
+		$exclude_via = array_map( 'strtolower', array_map( 'trim', (array) $args['exclude_via'] ) );
+		$gateways    = array_map( 'strtolower', array_map( 'trim', (array) $args['wallet_gateways'] ) );
+		$keywords    = (array) $args['wallet_keywords'];
+		$products    = array_values( array_filter( array_map( 'absint', (array) $args['wallet_products'] ) ) );
 
-		$kept          = array();
-		$skipped_zero  = 0;
-		$skipped_admin = 0;
+		$kept                   = array();
+		$skipped_zero           = 0;
+		$skipped_via            = 0;
 		$skipped_wallet_payment = 0;
 
 		foreach ( $rows as $row ) {
@@ -173,7 +213,7 @@ class Srevc_Query {
 				continue;
 			}
 			if ( ! empty( $exclude_via ) && in_array( $via, $exclude_via, true ) ) {
-				++$skipped_admin;
+				++$skipped_via;
 				continue;
 			}
 			if ( ! empty( $args['exclude_wallet_payment'] ) && ! empty( $gateways ) && in_array( $pay, $gateways, true ) ) {
@@ -185,22 +225,36 @@ class Srevc_Query {
 
 		$order_ids = wp_list_pluck( $kept, 'order_id' );
 		$wallet    = self::wallet_order_ids( $order_ids, $keywords, $products );
+		$coupons   = self::coupon_data( $order_ids );
 
-		$groups = array();
-		$total_revenue = 0.0;
+		$groups         = array();
+		$payments       = array();
+		$coupon_groups  = array();
+		$total_revenue  = 0.0;
 		$wallet_revenue = 0.0;
 		$wallet_count   = 0;
+		$manual_revenue = 0.0;
+		$manual_count   = 0;
+		$gateway_total  = 0.0;
+		$gateway_count  = 0;
+		$coupon_total   = 0.0;
+		$coupon_count   = 0;
+		$coupon_saved   = 0.0;
 
 		foreach ( $kept as $row ) {
 			$amount    = round( (float) $row->order_total, 2 );
 			$id        = (int) $row->order_id;
+			$via       = strtolower( (string) $row->created_via );
+			$pay       = strtolower( (string) $row->payment_method );
 			$is_wallet = isset( $wallet[ $id ] );
+			$is_manual = ( 'admin' === $via );
 			$type      = $is_wallet ? 'wallet' : 'order';
-			$key       = $type . '|' . number_format( $amount, 2, '.', '' );
+			$key       = $type . '|' . ( $is_manual ? 'manual' : 'normal' ) . '|' . number_format( $amount, 2, '.', '' );
 
 			if ( ! isset( $groups[ $key ] ) ) {
 				$groups[ $key ] = array(
 					'type'   => $type,
+					'manual' => $is_manual,
 					'amount' => $amount,
 					'count'  => 0,
 					'sum'    => 0.0,
@@ -214,18 +268,60 @@ class Srevc_Query {
 				$wallet_revenue += $amount;
 				++$wallet_count;
 			}
+			if ( $is_manual ) {
+				$manual_revenue += $amount;
+				++$manual_count;
+			}
+			if ( ! empty( $gateways ) && in_array( $pay, $gateways, true ) ) {
+				$gateway_total += $amount;
+				++$gateway_count;
+			}
+
+			$pay_key = '' !== $pay ? $pay : 'unknown';
+			if ( ! isset( $payments[ $pay_key ] ) ) {
+				$title = trim( (string) $row->payment_method_title );
+				if ( '' === $title ) {
+					$title = ( 'unknown' === $pay_key ) ? 'نامشخص' : $pay_key;
+				}
+				$payments[ $pay_key ] = array(
+					'method' => $pay_key,
+					'title'  => $title,
+					'count'  => 0,
+					'sum'    => 0.0,
+				);
+			}
+			++$payments[ $pay_key ]['count'];
+			$payments[ $pay_key ]['sum'] += $amount;
+
+			if ( ! empty( $coupons[ $id ] ) ) {
+				$coupon_total += $amount;
+				++$coupon_count;
+				foreach ( $coupons[ $id ] as $coupon ) {
+					$code = '' !== $coupon['code'] ? $coupon['code'] : 'بدون کد';
+					if ( ! isset( $coupon_groups[ $code ] ) ) {
+						$coupon_groups[ $code ] = array(
+							'code'     => $code,
+							'count'    => 0,
+							'sum'      => 0.0,
+							'discount' => 0.0,
+						);
+					}
+					++$coupon_groups[ $code ]['count'];
+					$coupon_groups[ $code ]['sum']      += $amount;
+					$coupon_groups[ $code ]['discount'] += $coupon['discount'];
+					$coupon_saved                       += $coupon['discount'];
+				}
+			}
 		}
 
 		$groups = array_values( $groups );
-		usort(
-			$groups,
-			function ( $a, $b ) {
-				if ( $a['sum'] === $b['sum'] ) {
-					return $b['count'] <=> $a['count'];
-				}
-				return ( $b['sum'] < $a['sum'] ) ? -1 : 1;
-			}
-		);
+		usort( $groups, array( __CLASS__, 'compare_sum' ) );
+
+		$payments = array_values( $payments );
+		usort( $payments, array( __CLASS__, 'compare_sum' ) );
+
+		$coupon_groups = array_values( $coupon_groups );
+		usort( $coupon_groups, array( __CLASS__, 'compare_sum' ) );
 
 		$count = count( $kept );
 
@@ -236,18 +332,33 @@ class Srevc_Query {
 			'total'                  => $total_revenue,
 			'count'                  => $count,
 			'average'                => $count > 0 ? ( $total_revenue / $count ) : 0.0,
-			'max'                    => $count > 0 ? max( wp_list_pluck( $groups, 'amount' ) ) : 0.0,
 			'groups'                 => $groups,
+			'payments'               => $payments,
+			'coupons'                => $coupon_groups,
 			'wallet_total'           => $wallet_revenue,
 			'wallet_count'           => $wallet_count,
 			'sales_total'            => $total_revenue - $wallet_revenue,
 			'sales_count'            => $count - $wallet_count,
+			'manual_total'           => $manual_revenue,
+			'manual_count'           => $manual_count,
+			'gateway_wallet_total'   => $gateway_total,
+			'gateway_wallet_count'   => $gateway_count,
+			'coupon_total'           => $coupon_total,
+			'coupon_count'           => $coupon_count,
+			'coupon_discount'        => $coupon_saved,
 			'skipped_zero'           => $skipped_zero,
-			'skipped_admin'          => $skipped_admin,
+			'skipped_via'            => $skipped_via,
 			'skipped_wallet_payment' => $skipped_wallet_payment,
 			'scanned'                => count( $rows ),
 			'storage'                => self::is_hpos() ? 'hpos' : 'legacy',
 			'db_error'               => $wpdb->last_error,
 		);
+	}
+
+	public static function compare_sum( $a, $b ) {
+		if ( $a['sum'] === $b['sum'] ) {
+			return $b['count'] <=> $a['count'];
+		}
+		return ( $b['sum'] < $a['sum'] ) ? -1 : 1;
 	}
 }

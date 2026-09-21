@@ -2,6 +2,8 @@
 defined( 'WP_UNINSTALL_PLUGIN' ) || exit;
 
 delete_option( 'srevc_settings' );
+delete_option( 'srevc_version' );
+delete_option( 'srevc_delete_log' );
 delete_transient( 'srevc_last_report' );
 
 if ( is_multisite() ) {
@@ -9,6 +11,8 @@ if ( is_multisite() ) {
 	foreach ( $sites as $site_id ) {
 		switch_to_blog( $site_id );
 		delete_option( 'srevc_settings' );
+		delete_option( 'srevc_version' );
+		delete_option( 'srevc_delete_log' );
 		delete_transient( 'srevc_last_report' );
 		restore_current_blog();
 	}

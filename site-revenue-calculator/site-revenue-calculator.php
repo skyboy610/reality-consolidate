@@ -3,7 +3,7 @@
  * Plugin Name: Site Revenue Calculator
  * Plugin URI: https://github.com/skyboy610/reality-consolidate
  * Description: محاسبه دقیق درآمد سایت بر اساس بازه هفتگی، ماهانه و تاریخ دلخواه شمسی، همراه با تفکیک کامل مبالغ و تعداد تراکنش‌ها.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Requires at least: 5.6
  * Requires PHP: 7.4
  * Author: Digital Team
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'SREVC_VERSION', '1.0.0' );
+define( 'SREVC_VERSION', '1.1.0' );
 define( 'SREVC_FILE', __FILE__ );
 define( 'SREVC_PATH', plugin_dir_path( __FILE__ ) );
 define( 'SREVC_URL', plugin_dir_url( __FILE__ ) );
@@ -28,13 +28,16 @@ require_once SREVC_PATH . 'includes/class-srevc-jalali.php';
 require_once SREVC_PATH . 'includes/class-srevc-format.php';
 require_once SREVC_PATH . 'includes/class-srevc-range.php';
 require_once SREVC_PATH . 'includes/class-srevc-query.php';
+require_once SREVC_PATH . 'includes/class-srevc-cleanup.php';
 require_once SREVC_PATH . 'includes/class-srevc-settings.php';
 require_once SREVC_PATH . 'includes/class-srevc-admin.php';
 
 function srevc_default_settings() {
 	return array(
 		'statuses'               => array( 'wc-completed', 'wc-processing' ),
-		'exclude_via'            => array( 'admin' ),
+		'exclude_via'            => array(),
+		'manual_via'             => 'admin',
+		'cleanup_window'         => 3,
 		'exclude_zero'           => 1,
 		'wallet_keywords'        => 'کیف پول, شارژ حساب',
 		'wallet_products'        => '',
@@ -67,6 +70,29 @@ function srevc_activate() {
 	if ( false === get_option( SREVC_OPTION, false ) ) {
 		add_option( SREVC_OPTION, srevc_default_settings() );
 	}
+	srevc_maybe_upgrade();
+}
+
+function srevc_maybe_upgrade() {
+	$stored = get_option( 'srevc_version', '1.0.0' );
+	if ( version_compare( $stored, SREVC_VERSION, '>=' ) ) {
+		return;
+	}
+
+	$settings = srevc_get_settings();
+
+	if ( version_compare( $stored, '1.1.0', '<' ) ) {
+		$settings['exclude_via'] = array_values( array_diff( (array) $settings['exclude_via'], array( 'admin' ) ) );
+		if ( empty( $settings['manual_via'] ) ) {
+			$settings['manual_via'] = 'admin';
+		}
+		if ( empty( $settings['cleanup_window'] ) ) {
+			$settings['cleanup_window'] = 3;
+		}
+	}
+
+	update_option( SREVC_OPTION, $settings );
+	update_option( 'srevc_version', SREVC_VERSION );
 }
 register_activation_hook( SREVC_FILE, 'srevc_activate' );
 
@@ -91,6 +117,7 @@ function srevc_missing_woocommerce_notice() {
 add_action( 'admin_notices', 'srevc_missing_woocommerce_notice' );
 
 function srevc_bootstrap() {
+	srevc_maybe_upgrade();
 	Srevc_Settings::init();
 	Srevc_Admin::init();
 }
