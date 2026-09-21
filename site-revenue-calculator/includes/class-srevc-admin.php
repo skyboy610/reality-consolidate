@@ -489,22 +489,66 @@ class Srevc_Admin {
 
 		$body  = "\xEF\xBB\xBF";
 		$body .= self::csv_line( array( 'بازه گزارش', Srevc_Range::label( $report['start'], $report['end'] ) ) );
-		$body .= self::csv_line( array( 'مبلغ کل', Srevc_Format::raw_number( $report['total'], $settings ), $settings['currency_label'] ) );
-		$body .= self::csv_line( array( 'تعداد کل تراکنش', $report['count'] ) );
-		$body .= self::csv_line( array( 'شارژ کیف پول', Srevc_Format::raw_number( $report['wallet_total'], $settings ), $report['wallet_count'] ) );
-		$body .= self::csv_line( array( 'فروش خدمات', Srevc_Format::raw_number( $report['sales_total'], $settings ), $report['sales_count'] ) );
+		$body .= self::csv_line( array( 'واحد پول', $settings['currency_label'] ) );
 		$body .= self::csv_line( array( '' ) );
-		$body .= self::csv_line( array( 'نوع تراکنش', 'مبلغ هر تراکنش', 'تعداد', 'جمع مبلغ' ) );
 
+		$body .= self::csv_line( array( 'شاخص', 'مبلغ', 'تعداد' ) );
+		$body .= self::csv_line( array( 'مبلغ کل', Srevc_Format::raw_number( $report['total'], $settings ), $report['count'] ) );
+		$body .= self::csv_line( array( 'میانگین هر تراکنش', Srevc_Format::raw_number( $report['average'], $settings ), '' ) );
+		$body .= self::csv_line( array( 'فروش خدمات', Srevc_Format::raw_number( $report['sales_total'], $settings ), $report['sales_count'] ) );
+		$body .= self::csv_line( array( 'شارژ کیف پول', Srevc_Format::raw_number( $report['wallet_total'], $settings ), $report['wallet_count'] ) );
+		$body .= self::csv_line( array( 'سفارش دستی مدیر', Srevc_Format::raw_number( $report['manual_total'], $settings ), $report['manual_count'] ) );
+		$body .= self::csv_line( array( 'پرداخت با کیف پول', Srevc_Format::raw_number( $report['gateway_wallet_total'], $settings ), $report['gateway_wallet_count'] ) );
+		$body .= self::csv_line( array( 'سفارش با کوپن', Srevc_Format::raw_number( $report['coupon_total'], $settings ), $report['coupon_count'] ) );
+		$body .= self::csv_line( array( 'جمع تخفیف کوپن', Srevc_Format::raw_number( $report['coupon_discount'], $settings ), '' ) );
+		$body .= self::csv_line( array( 'تراکنش صفر حذف‌شده', '', $report['skipped_zero'] ) );
+		$body .= self::csv_line( array( 'سفارش کنارگذاشته‌شده', '', $report['skipped_via'] ) );
+		$body .= self::csv_line( array( '' ) );
+
+		$body .= self::csv_line( array( 'تفکیک بر اساس مبلغ', '', '', '' ) );
+		$body .= self::csv_line( array( 'نوع تراکنش', 'مبلغ هر تراکنش', 'تعداد', 'جمع مبلغ' ) );
 		foreach ( $report['groups'] as $group ) {
+			$badge = self::group_badge( $group );
 			$body .= self::csv_line(
 				array(
-					( 'wallet' === $group['type'] ) ? 'شارژ کیف پول' : 'فروش / خدمات',
+					$badge['label'],
 					Srevc_Format::raw_number( $group['amount'], $settings ),
 					$group['count'],
 					Srevc_Format::raw_number( $group['sum'], $settings ),
 				)
 			);
+		}
+
+		if ( ! empty( $report['payments'] ) ) {
+			$body .= self::csv_line( array( '' ) );
+			$body .= self::csv_line( array( 'تفکیک بر اساس روش پرداخت', '', '', '' ) );
+			$body .= self::csv_line( array( 'روش پرداخت', 'شناسه درگاه', 'تعداد', 'جمع مبلغ' ) );
+			foreach ( $report['payments'] as $payment ) {
+				$body .= self::csv_line(
+					array(
+						$payment['title'],
+						$payment['method'],
+						$payment['count'],
+						Srevc_Format::raw_number( $payment['sum'], $settings ),
+					)
+				);
+			}
+		}
+
+		if ( ! empty( $report['coupons'] ) ) {
+			$body .= self::csv_line( array( '' ) );
+			$body .= self::csv_line( array( 'تفکیک بر اساس کوپن', '', '', '' ) );
+			$body .= self::csv_line( array( 'کد کوپن', 'تعداد استفاده', 'جمع مبلغ سفارش‌ها', 'جمع تخفیف' ) );
+			foreach ( $report['coupons'] as $coupon ) {
+				$body .= self::csv_line(
+					array(
+						$coupon['code'],
+						$coupon['count'],
+						Srevc_Format::raw_number( $coupon['sum'], $settings ),
+						Srevc_Format::raw_number( $coupon['discount'], $settings ),
+					)
+				);
+			}
 		}
 
 		nocache_headers();
@@ -699,6 +743,10 @@ class Srevc_Admin {
 						<div class="srevc-group">
 							<div class="srevc-group-head">
 								<span class="srevc-group-title"><?php echo esc_html( sprintf( 'مشتری: %s', $group['admin']['customer'] ) ); ?></span>
+								<label class="srevc-group-select">
+									<input type="checkbox" data-srevc-toggle-group="1" />
+									<span><?php esc_html_e( 'انتخاب همه این گروه', 'site-revenue-calculator' ); ?></span>
+								</label>
 								<span class="srevc-group-meta">
 									<?php
 									echo esc_html(

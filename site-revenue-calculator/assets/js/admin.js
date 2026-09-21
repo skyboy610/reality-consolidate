@@ -310,6 +310,20 @@
 			hidePicker();
 		} );
 
+		document.addEventListener( 'change', function ( event ) {
+			if ( ! event.target.hasAttribute || ! event.target.hasAttribute( 'data-srevc-toggle-group' ) ) {
+				return;
+			}
+			var group = event.target.closest ? event.target.closest( '.srevc-group' ) : null;
+			if ( ! group ) {
+				return;
+			}
+			var boxes = group.querySelectorAll( 'input[name="srevc_orders[]"]' );
+			Array.prototype.forEach.call( boxes, function ( box ) {
+				box.checked = event.target.checked;
+			} );
+		} );
+
 		document.addEventListener( 'click', function ( event ) {
 			var target = event.target.closest ? event.target.closest( '[data-srevc-confirm]' ) : null;
 			if ( ! target ) {

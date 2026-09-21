@@ -3,7 +3,7 @@
  * Plugin Name: Site Revenue Calculator
  * Plugin URI: https://github.com/skyboy610/reality-consolidate
  * Description: محاسبه دقیق درآمد سایت بر اساس بازه هفتگی، ماهانه و تاریخ دلخواه شمسی، همراه با تفکیک کامل مبالغ و تعداد تراکنش‌ها.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Requires at least: 5.6
  * Requires PHP: 7.4
  * Author: Digital Team
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'SREVC_VERSION', '1.1.0' );
+define( 'SREVC_VERSION', '1.2.0' );
 define( 'SREVC_FILE', __FILE__ );
 define( 'SREVC_PATH', plugin_dir_path( __FILE__ ) );
 define( 'SREVC_URL', plugin_dir_url( __FILE__ ) );

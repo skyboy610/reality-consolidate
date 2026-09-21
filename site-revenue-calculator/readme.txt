@@ -4,7 +4,7 @@ Tags: woocommerce, revenue, report, jalali, wallet
 Requires at least: 5.6
 Tested up to: 6.8
 Requires PHP: 7.4
-Stable tag: 1.1.0
+Stable tag: 1.2.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -32,6 +32,10 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 3. از منوی «محاسبه درآمد» گزارش را ببینید و در صورت نیاز از زیرمنوی «تنظیمات» وضعیت‌ها و کلیدواژه کیف پول را تنظیم کنید.
 
 == Changelog ==
+
+= 1.2.0 =
+* خروجی CSV کامل شد: شاخص‌های کلی، تفکیک مبلغ با نام دسته، تفکیک روش پرداخت و تفکیک کوپن.
+* افزودن چک‌باکس «انتخاب همه این گروه» در ابزار پاک‌سازی سفارش تکراری.
 
 = 1.1.0 =
 * رفع خطای کوئری در حالت HPOS: ستون created_via در جدول wc_order_operational_data خوانده می‌شود.
